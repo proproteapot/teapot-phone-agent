@@ -4,7 +4,9 @@
 
 **Self-hosted Android MCP Bridge (No PC, No Root): Let AI Agents operate Android apps on a true offscreen virtual display and run background Termux services while your primary screen stays untouched.**
 
-> [简体中文](#简体中文) | [English](#english) | [🤖 Agent 一键部署指南](AGENT_DEPLOY.md) | [🔒 安全模型](SECURITY.md)
+> [简体中文](#简体中文) | [English](#english) | [🤖 Agent 一键部署指南](AGENT_DEPLOY.md) | [🔒 安全模型与风险提示](SECURITY.md)
+>
+> ⚠️ **安全与风险提示 / Security Notice**：本项目涉及无障碍屏幕控制、Shizuku 离屏虚拟屏、全文件访问与可选 Termux 命令，属于高权限个人自托管工具。默认采用最小权限（高危开关默认关闭、屏幕控制默认本机确认），部署前请务必阅读 [SECURITY.md](SECURITY.md) 中的已知风险与安全边界。
 
 ---
 

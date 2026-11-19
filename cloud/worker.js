@@ -9,6 +9,7 @@ const noStore = {
 };
 
 const MAX_MCP_BODY_BYTES = 262144; // 256 KiB
+const MAX_PHONE_REPLY_BYTES = 4 * 1024 * 1024; // 4 MiB（允许手机回传 1 MiB 文本与高清截图）
 const MAX_OAUTH_BODY_BYTES = 16384;
 
 function sha256Base64Url(input) {
@@ -364,7 +365,8 @@ async function handleRequest(request, env, url, hub) {
     }
     await hub.clearAuthFailures(lockKey);
 
-    const bodyCheck = await readTextLimited(request, MAX_MCP_BODY_BYTES);
+    const maxBodyBytes = url.pathname === '/_phone/reply' ? MAX_PHONE_REPLY_BYTES : MAX_MCP_BODY_BYTES;
+    const bodyCheck = await readTextLimited(request, maxBodyBytes);
     if (bodyCheck.tooLarge) return Response.json({ error: 'Payload Too Large' }, { status: 413, headers: noStore });
     let payload = {};
     try { payload = bodyCheck.text ? JSON.parse(bodyCheck.text) : {}; } catch {}
@@ -386,13 +388,22 @@ async function handleRequest(request, env, url, hub) {
     return Response.json({ error: 'Not Found' }, { status: 404, headers: noStore });
   }
 
-  // 匿名 /health 仅返回最小存活状态，携带合法 Bearer 鉴权后返回完整设备诊断
+  // 匿名 /health 仅返回最小存活状态，携带合法 Bearer 鉴权后返回完整设备诊断（带错凭据计入 IP 锁定防爆破）
   if (url.pathname === '/health' && request.method === 'GET') {
-    const isDirectSecret = Boolean(secret && bearer && safeEquals(bearer, secret));
-    const isOAuth = !isDirectSecret && Boolean(bearer && (await hub.verifyAccessToken(bearer)));
-    if (!isDirectSecret && !isOAuth) {
+    if (!bearer) {
       return Response.json({ ok: true, service: 'teapot-phone-agent' }, { headers: noStore });
     }
+    const lockKey = `health_fail:${ip}`;
+    if (await hub.isAuthLocked(lockKey, 15, 15 * 60 * 1000)) {
+      return Response.json({ error: 'Too Many Requests' }, { status: 429, headers: noStore });
+    }
+    const isDirectSecret = Boolean(secret && safeEquals(bearer, secret));
+    const isOAuth = !isDirectSecret && Boolean(await hub.verifyAccessToken(bearer));
+    if (!isDirectSecret && !isOAuth) {
+      await hub.recordAuthFailure(lockKey, 15, 15 * 60 * 1000);
+      return Response.json({ ok: true, service: 'teapot-phone-agent' }, { headers: noStore });
+    }
+    await hub.clearAuthFailures(lockKey);
     const info = await hub.getTunnel();
     return Response.json({
       ok: true,

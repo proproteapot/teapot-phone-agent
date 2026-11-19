@@ -172,3 +172,35 @@ test('explicit /_phone/offline causes immediate phone_offline response', async (
   const body = await res.json();
   assert.equal(body.error.data.error_code, 'phone_offline');
 });
+
+test('/_phone/reply accepts payloads larger than 256 KiB (up to 4 MiB) for screenshots and text files', async () => {
+  const { hub } = makeHub();
+  const env = { PHONE_SECRET: 'test-secret', PHONE_HUB: { idFromName: () => 'test', get: () => hub } };
+  const bigBody = JSON.stringify({ id: 'task-big', status: 200, body: 'b'.repeat(400 * 1024) });
+  const res = await worker.fetch(new Request('https://example.test/_phone/reply', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer test-secret', 'Content-Type': 'application/json', 'CF-Connecting-IP': '10.0.0.10' },
+    body: bigBody,
+  }), env);
+  assert.equal(res.status, 200);
+});
+
+test('GET /health locks out repeated wrong Bearer tokens per IP without affecting anonymous probes', async () => {
+  const { hub } = makeHub();
+  const env = { PHONE_SECRET: 'test-secret', PHONE_HUB: { idFromName: () => 'test', get: () => hub } };
+  for (let i = 0; i < 15; i++) {
+    const r = await worker.fetch(new Request('https://example.test/health', {
+      headers: { Authorization: 'Bearer wrong', 'CF-Connecting-IP': '10.0.0.20' },
+    }), env);
+    assert.equal(r.status, 200);
+  }
+  const locked = await worker.fetch(new Request('https://example.test/health', {
+    headers: { Authorization: 'Bearer test-secret', 'CF-Connecting-IP': '10.0.0.20' },
+  }), env);
+  assert.equal(locked.status, 429);
+
+  const anon = await worker.fetch(new Request('https://example.test/health', {
+    headers: { 'CF-Connecting-IP': '10.0.0.20' },
+  }), env);
+  assert.equal(anon.status, 200);
+});

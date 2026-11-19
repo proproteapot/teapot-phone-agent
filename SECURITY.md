@@ -26,8 +26,15 @@
 - **文件系统安全**：删除操作默认移入 `Download/.PhoneAgentTrash/` 回收站；覆盖写入采用原子临时文件替换；压缩/解压内置路径穿越校验、符号链接跳过、5000 条目与 512 MiB 解压上限；`LocalFileProvider` 独立封锁 `Android/` 目录；`open_file_on_phone` 禁止远程唤起 `.apk` 安装包。
 - **构建与默认行为**：首次安装默认不自动开启公网外联（需用户显式点击「启动 / 重连服务」）；`app/build.gradle` 已配置非调试 `release` 构建类型供日用签名安装。
 
-### 3. 合理使用与漏洞上报
-- 本项目仅供个人在**自己拥有且明确授权**的 Android 设备上自托管使用，禁止用于未授权访问、规避平台风控或自动化滥用。
+### 3. 已知风险与安全边界（请自托管前阅读）
+本项目属于面向高级用户/开发者的**高权限个人自托管工具**，在开启无障碍、Shizuku、全文件访问或 Termux 能力后，请注意以下固有边界：
+- **高权限能力与提示词注入（Prompt Injection）风险**：虽已内置受保护包黑名单（拦截本应用、系统权限弹窗、安装器、Shizuku 界面），但远程 LLM 在操作第三方网页、聊天消息或分屏/小窗界面时，仍可能受页面恶意文本诱导执行非预期点击或文件操作。建议保持默认的「本机人工确认模式」，不要在包含高敏感金融/密码界面的场景下保持会话开启。
+- **离屏虚拟屏特性**：基于 Android `DisplayManagerGlobal` 创建的虚拟屏带有 `FLAG_ALWAYS_UNLOCKED` 标志以支持后台独立运行；任务结束后应及时调用 `virtual_display_destroy`（该工具免审批以便随时清理）或在手机端停止服务释放虚拟屏。
+- **宽松开关与 Termux 风险**：若用户在设置中手动开启「屏幕控制免确认自动续期」「允许后台 Termux 命令执行」或「Shizuku 自动恢复无障碍」，代表你完全信任所绑定的远程 MCP 客户端与自托管网关，请妥善保管 `PHONE_SECRET` 并定期使用「重置连接码」轮换凭据。
+- **本机 HTTP 服务组件**：Android 端内嵌 `NanoHTTPD 2.3.1` 仅绑定 `127.0.0.1:8765` 回环地址，并已移除 `CORS: *`、限制请求体体积与增加 Origin/CSP/防爆破校验；未来版本计划替换为更现代的轻量 HTTP 实现。
+- **单人自托管免责**：本项目不提供多租户公共服务器，请仅在**自己拥有且明确授权**的设备上自托管，切勿在公共或共享设备上运行，亦不得用于未授权访问或自动化滥用。
+
+### 4. 漏洞上报
 - 如发现安全漏洞，请勿在公开 Issue 中披露利用细节，请通过 GitHub Security Advisory 或仓库维护者私密渠道报告。
 
 ---
@@ -53,6 +60,13 @@
 - **Termux Background Commands (Disabled by Default)**: All Termux execution/log/refresh IPC paths check the opt-in toggle; `probe_url` / `probe_port` are strictly limited to loopback `http://127.0.0.1` / `localhost` (excluding port `8765`, redirects disabled).
 - **Filesystem Safety**: Deletions default to `Download/.PhoneAgentTrash/`; overwrites are atomic; zip/unzip guards against traversal, symlinks, >5000 entries, and >512 MiB extraction; `LocalFileProvider` independently blocks `Android/`; `open_file_on_phone` blocks `.apk` installs.
 
-### 3. Responsible Use & Vulnerability Reporting
-- This project is intended strictly for personal self-hosting on devices you own and control.
+### 3. Known Risks & Limitations (Read Before Self-Hosting)
+This is a **high-privilege personal self-hosted tool** for developers and power users. When enabling Accessibility, Shizuku, All-Files Access, or Termux execution, keep these inherent boundaries in mind:
+- **Prompt Injection & Multi-Window Surfaces**: While a built-in protected-package guard blocks this app, system permission controllers, installers, and Shizuku UIs, an LLM driving third-party apps, web pages, or split-screen/pop-up windows can still be tricked by untrusted content. Keep the default on-device manual approval mode enabled and avoid running sessions near banking/password screens.
+- **Virtual Display Lifecycle**: Offscreen virtual displays use `FLAG_ALWAYS_UNLOCKED` so apps can run independently in the background. Destroy displays promptly via `virtual_display_destroy` (ungated for safe cleanup) or stop the service when finished.
+- **Opt-In Relaxed Toggles & Termux**: Enabling auto-renewal, Termux execution, or Shizuku accessibility auto-restore grants broad autonomy to your bound MCP client. Protect your `PHONE_SECRET` and rotate it via the app UI whenever needed.
+- **Local Loopback HTTP Server**: The embedded `NanoHTTPD 2.3.1` binds strictly to `127.0.0.1:8765` with `CORS: *` removed and strict Origin/CSP/rate-limit/body-cap checks applied; migrating to a modern lightweight HTTP server is planned for a future release.
+- **Personal Self-Hosting Only**: No multi-tenant hosted service is provided. Deploy strictly on devices and accounts you own and control.
+
+### 4. Vulnerability Reporting
 - Please report security vulnerabilities privately via GitHub Security Advisories rather than public issues.

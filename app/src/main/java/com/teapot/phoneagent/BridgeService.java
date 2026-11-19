@@ -598,7 +598,6 @@ public final class BridgeService extends Service {
                     } catch (Exception e) { result = classifiedErrorResult("virtual_display_create", e); }
                 } else if ("tools/call".equals(method) && "virtual_display_destroy".equals(req.getJSONObject("params").getString("name"))) {
                     try {
-                        ScreenControlService.authorized();
                         JSONObject a = req.getJSONObject("params").getJSONObject("arguments");
                         JSONObject resObj = ShizukuBridge.destroyVirtualDisplay(a.getInt("display_id"));
                         result = textResult(resObj.toString(), !resObj.optBoolean("ok", false));
@@ -740,8 +739,7 @@ public final class BridgeService extends Service {
         }
         private boolean isAllowedLocalOrigin(String origin, String baseUrl) {
             String o = origin.trim();
-            return o.equals(baseUrl)
-                    || o.equals("http://127.0.0.1:8765")
+            return o.equals("http://127.0.0.1:8765")
                     || o.equals("http://localhost:8765");
         }
         private Response.IStatus status429() {
