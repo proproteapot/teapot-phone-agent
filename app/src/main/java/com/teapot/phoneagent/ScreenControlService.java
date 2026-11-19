@@ -58,7 +58,15 @@ public final class ScreenControlService extends AccessibilityService {
             "moe.shizuku.privileged.api",
             "com.android.packageinstaller",
             "com.google.android.packageinstaller",
-            "com.miui.packageinstaller"
+            "com.miui.packageinstaller",
+            "com.samsung.android.packageinstaller",
+            "com.samsung.android.permissioncontroller",
+            "com.oplus.securitypermission",
+            "com.coloros.securitypermission",
+            "com.oplus.appdetail",
+            "com.vivo.permissionmanager",
+            "com.huawei.systemmanager",
+            "com.hihonor.systemmanager"
     ));
 
     static boolean isProtectedPackage(String pkg) {
@@ -1058,7 +1066,7 @@ public final class ScreenControlService extends AccessibilityService {
                     .put("screen", snap);
         }
         String needle = untilText.trim().toLowerCase(Locale.ROOT);
-        long maxWait = Math.max(500, Math.min(15000, timeoutMs));
+        long maxWait = Math.max(500, Math.min(12000, timeoutMs));
         JSONObject lastSnap = null;
         boolean matched = false;
         while (System.currentTimeMillis() - start < maxWait) {

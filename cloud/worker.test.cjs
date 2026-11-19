@@ -204,3 +204,67 @@ test('GET /health locks out repeated wrong Bearer tokens per IP without affectin
   }), env);
   assert.equal(anon.status, 200);
 });
+
+test('rotating PHONE_SECRET automatically invalidates existing OAuth tokens and auth codes', async () => {
+  const { hub } = makeHub();
+  const envOld = { PHONE_SECRET: 'old-secret', PHONE_HUB: { idFromName: () => 'test', get: () => hub } };
+  await worker.fetch(new Request('https://example.test/health'), envOld);
+  const pair = hub.mintTokens();
+  const code = hub.createAuthCode('https://chatgpt.com/connector_platform_oauth_redirect', 'A'.repeat(43), 'S256');
+  assert.equal(hub.verifyAccessToken(pair.access_token), true);
+
+  const envNew = { PHONE_SECRET: 'new-secret', PHONE_HUB: { idFromName: () => 'test', get: () => hub } };
+  const mcpRes = await worker.fetch(new Request('https://example.test/mcp', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${pair.access_token}`, 'CF-Connecting-IP': '10.0.0.30' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }),
+  }), envNew);
+  assert.equal(mcpRes.status, 401);
+  assert.equal(hub.exchangeToken({ grant_type: 'refresh_token', refresh_token: pair.refresh_token }).error, 'invalid_grant');
+  assert.equal(hub.exchangeToken({
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: 'https://chatgpt.com/connector_platform_oauth_redirect',
+    code_verifier: 'x'.repeat(43),
+  }).error, 'invalid_grant');
+});
+
+test('/_phone/offline drains active pollWaiters so subsequent /mcp fails fast with phone_offline', async () => {
+  const { hub } = makeHub();
+  const env = { PHONE_SECRET: 'test-secret', PHONE_HUB: { idFromName: () => 'test', get: () => hub } };
+  const activePoll = hub.pollTask(15000);
+  assert.equal(hub.getTunnel().poll_waiters, 1);
+
+  const off = await worker.fetch(new Request('https://example.test/_phone/offline', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer test-secret' },
+    body: '{}',
+  }), env);
+  assert.equal(off.status, 200);
+  assert.deepEqual(await activePoll, { has_task: false });
+  assert.equal(hub.getTunnel().direct_online, false);
+
+  const start = Date.now();
+  const res = await worker.fetch(new Request('https://example.test/mcp', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer test-secret' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'ping' }),
+  }), env);
+  assert.equal(res.status, 503);
+  assert.ok(Date.now() - start < 1000);
+  assert.equal((await res.json()).error.data.error_code, 'phone_offline');
+});
+
+test('OAuth callback allowlist enforces exact paths for chat.openai.com and claude.ai', async () => {
+  const { hub } = makeHub();
+  const env = { PHONE_SECRET: 'test-secret', PHONE_HUB: { idFromName: () => 'test', get: () => hub } };
+  const challenge = '&code_challenge=' + 'A'.repeat(43) + '&code_challenge_method=S256';
+  const badClaude = await worker.fetch(new Request('https://example.test/authorize?redirect_uri=' + encodeURIComponent('https://claude.ai/other/path') + challenge), env);
+  assert.equal(badClaude.status, 400);
+  const okClaude = await worker.fetch(new Request('https://example.test/authorize?redirect_uri=' + encodeURIComponent('https://claude.ai/api/mcp/auth_callback') + challenge), env);
+  assert.equal(okClaude.status, 200);
+  const badOpenAi = await worker.fetch(new Request('https://example.test/authorize?redirect_uri=' + encodeURIComponent('https://chat.openai.com/arbitrary') + challenge), env);
+  assert.equal(badOpenAi.status, 400);
+  const okOpenAi = await worker.fetch(new Request('https://example.test/authorize?redirect_uri=' + encodeURIComponent('https://chat.openai.com/aip/plugin-oauth/callback') + challenge), env);
+  assert.equal(okOpenAi.status, 200);
+});

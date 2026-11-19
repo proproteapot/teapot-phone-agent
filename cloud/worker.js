@@ -60,9 +60,23 @@ function validCallback(uri, env) {
     return uri === 'https://chatgpt.com/connector_platform_oauth_redirect'
       || /^https:\/\/chatgpt\.com\/connector\/oauth\/[\w-]+$/.test(uri);
   }
-  if (host === 'chat.openai.com' || host === 'claude.ai') return true;
+  if (host === 'chat.openai.com') {
+    return uri === 'https://chat.openai.com/aip/plugin-oauth/callback';
+  }
+  if (host === 'claude.ai') {
+    return uri === 'https://claude.ai/api/mcp/auth_callback';
+  }
   return extraAllowedHosts(env).includes(host);
 }
+
+const AUTH_HTML_HEADERS = {
+  ...noStore,
+  'Content-Type': 'text/html; charset=utf-8',
+  'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
+  'X-Frame-Options': 'DENY',
+  'X-Content-Type-Options': 'nosniff',
+  'Referrer-Policy': 'same-origin',
+};
 
 export class PhoneHub extends DurableObject {
   constructor(ctx, env) {
@@ -74,6 +88,7 @@ export class PhoneHub extends DurableObject {
     this.rateBuckets = new Map();
     this.lastPollAt = 0;
     this.phoneHealth = null;
+    this.cachedSecretFp = null;
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS state (
         k TEXT PRIMARY KEY,
@@ -115,6 +130,11 @@ export class PhoneHub extends DurableObject {
 
   recordAuthFailure(bucketKey, maxFailures, windowMs) {
     const now = Date.now();
+    if (this.rateBuckets.size > 1000) {
+      for (const [k, rec] of this.rateBuckets.entries()) {
+        if (now - rec.windowStart >= rec.windowMs) this.rateBuckets.delete(k);
+      }
+    }
     const existing = this.rateBuckets.get(bucketKey);
     if (!existing || (now - existing.windowStart) >= windowMs) {
       this.rateBuckets.set(bucketKey, { count: 1, windowStart: now, windowMs });
@@ -149,9 +169,36 @@ export class PhoneHub extends DurableObject {
     };
   }
 
+  /** 绑定当前 PHONE_SECRET 指纹：一旦轮换密钥，自动作废所有既有 OAuth 令牌与授权码 */
+  syncSecretFingerprint(secret) {
+    if (!secret || typeof secret !== 'string') return { rotated: false };
+    const fp = sha256Base64Url(`secret_fp:${secret}`);
+    if (this.cachedSecretFp === fp) return { rotated: false };
+    const rows = [...this.sql.exec(`SELECT v FROM state WHERE k = 'secret_fp'`)];
+    const now = Date.now();
+    let rotated = false;
+    if (rows.length > 0 && rows[0].v !== fp) {
+      this.sql.exec(`DELETE FROM oauth_tokens`);
+      this.sql.exec(`DELETE FROM auth_codes`);
+      rotated = true;
+    }
+    this.sql.exec(
+      `INSERT INTO state (k, v, updated_at) VALUES ('secret_fp', ?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v, updated_at = excluded.updated_at`,
+      fp,
+      now
+    );
+    this.cachedSecretFp = fp;
+    return { rotated };
+  }
+
   markOffline() {
     this.lastPollAt = 0;
     this.phoneHealth = null;
+    for (const waiter of Array.from(this.pollWaiters)) {
+      waiter({ has_task: false });
+    }
+    this.pollWaiters.clear();
+    this.lastPollAt = 0;
     return { ok: true, offline: true };
   }
 
@@ -179,7 +226,7 @@ export class PhoneHub extends DurableObject {
       const waiter = (task) => {
         clearTimeout(timer);
         this.pollWaiters.delete(waiter);
-        this.lastPollAt = Date.now();
+        if (task && task.has_task) this.lastPollAt = Date.now();
         resolve(task);
       };
       const timer = setTimeout(() => {
@@ -350,6 +397,9 @@ async function handleRequest(request, env, url, hub) {
   }
   const baseUrl = `${url.protocol}//${url.host}`;
   const secret = env.PHONE_SECRET || '';
+  if (secret && typeof hub.syncSecretFingerprint === 'function') {
+    await hub.syncSecretFingerprint(secret);
+  }
   const ip = clientIp(request);
   const bearer = extractBearer(request);
 
@@ -507,15 +557,15 @@ async function handleRequest(request, env, url, hub) {
       const ok = Boolean(secret && safeEquals(supplied, secret));
       const attempt = await hub.checkAndRecordAuthAttempt(ok, ip);
       if (attempt.locked) {
-        return new Response('<!doctype html><meta charset="utf-8"><h3>尝试次数过多，当前 IP 已临时锁定 15 分钟。</h3>', {
+        return new Response('<!doctype html><meta charset="utf-8"><h3>尝试次数过多，当前 IP 已临时锁定 15 分钟。<br><small>Too many failed attempts. Your IP is locked for 15 minutes.</small></h3>', {
           status: 429,
-          headers: { ...noStore, 'Content-Type': 'text/html; charset=utf-8' },
+          headers: AUTH_HTML_HEADERS,
         });
       }
       if (!ok) {
-        return new Response('<!doctype html><meta charset="utf-8"><h3>连接码错误，请返回重试。</h3>', {
+        return new Response('<!doctype html><meta charset="utf-8"><h3>连接码错误，请返回重试。<br><small>Invalid pairing token. Please go back and try again.</small></h3>', {
           status: 403,
-          headers: { ...noStore, 'Content-Type': 'text/html; charset=utf-8' },
+          headers: AUTH_HTML_HEADERS,
         });
       }
       const authCode = await hub.createAuthCode(redirectUri, codeChallenge, codeChallengeMethod);
@@ -591,13 +641,13 @@ async function handleRequest(request, env, url, hub) {
 
     const info = await hub.getTunnel();
     if (!info.direct_online) {
-      return mcpError(503, -32000, '手机当前未在线，请确认手机助手桥正在运行。', 'phone_offline', 'cloud_dispatch', true, {
+      return mcpError(503, -32000, '手机当前未在线，请确认 Teapot Phone-Agent 正在运行。', 'phone_offline', 'cloud_dispatch', true, {
         last_heartbeat_ms: info.last_heartbeat_ms || 0,
         heartbeat_age_ms: info.heartbeat_age_ms ?? null,
       });
     }
 
-    const dispatchTimeoutMs = info.poll_waiters > 0 ? 15000 : 3500;
+    const dispatchTimeoutMs = info.poll_waiters > 0 ? 24000 : 3500;
     const directRes = await hub.dispatchMcpToPhone(bodyText, dispatchTimeoutMs);
     if (directRes && directRes.ok) {
       return new Response(directRes.body || '{}', {
@@ -611,7 +661,7 @@ async function handleRequest(request, env, url, hub) {
     if (directRes.error === 'outcome_unknown') {
       return mcpError(504, -32001, '手机可能已执行请求但结果超时；请先检查结果，不要盲目重试。', 'request_timeout', 'phone_execution', false);
     }
-    return mcpError(503, -32000, '手机当前未在线或请求未送达，请确认手机助手桥状态。', 'phone_offline', 'cloud_dispatch', true);
+    return mcpError(503, -32000, '手机当前未在线或请求未送达，请确认 Teapot Phone-Agent 状态。', 'phone_offline', 'cloud_dispatch', true);
   }
 
   return new Response('Not Found', { status: 404, headers: noStore });

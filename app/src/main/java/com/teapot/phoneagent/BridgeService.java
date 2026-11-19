@@ -32,10 +32,10 @@ public final class BridgeService extends Service {
         if (android.os.Build.VERSION.SDK_INT >= 33) registerReceiver(screenOff, filter, android.content.Context.RECEIVER_NOT_EXPORTED);
         else registerReceiver(screenOff, filter);
         NotificationManager nm = getSystemService(NotificationManager.class);
-        nm.createNotificationChannel(new NotificationChannel(CHANNEL, "手机助手桥运行状态", NotificationManager.IMPORTANCE_LOW));
+        nm.createNotificationChannel(new NotificationChannel(CHANNEL, "Teapot Phone-Agent 运行状态", NotificationManager.IMPORTANCE_LOW));
         PendingIntent open = PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         Notification notification = new Notification.Builder(this, CHANNEL).setSmallIcon(android.R.drawable.stat_sys_upload)
-                .setContentTitle("手机助手桥正在运行").setContentText("仅监听手机本机；打开应用可停止").setContentIntent(open).setOngoing(true).build();
+                .setContentTitle("Teapot Phone-Agent 正在运行").setContentText("仅监听手机本机；打开应用可停止").setContentIntent(open).setOngoing(true).build();
         startForeground(1, notification);
         OAuthManager oauth = new OAuthManager(this);
         oauth.getOrCreatePairingToken();
@@ -201,7 +201,7 @@ public final class BridgeService extends Service {
                             .put("properties", new JSONObject().put("query", field("string", "可选：应用中文名或包名搜索关键字，如 '微信'、'美团'、'时钟'")));
                     JSONObject openAppSchema = new JSONObject().put("type", "object")
                             .put("properties", new JSONObject()
-                                    .put("app", field("string", "要启动的应用名称（如 '微信'、'美团'、'设置'、'时钟'、'相册'）或包名"))
+                                    .put("app", field("string", "要启动的应用名称（如 '微信'、'浏览器'、'时钟'、'相册'）或包名"))
                                     .put("display_id", field("integer", "目标屏幕 ID（默认 0 为主屏；传虚拟屏 ID 可在副屏启动）"))
                                     .put("url", field("string", "可选：要直接打开的网页 URL（适用于浏览器）"))
                                     .put("wait_ms", field("integer", "启动后等待界面稳定的毫秒数，默认 1200")))
@@ -289,7 +289,7 @@ public final class BridgeService extends Service {
                                     .put("wait_ms", field("integer", "停止服务时等待端口释放的毫秒数，默认 4000")));
                     JSONObject fsListSchema = new JSONObject().put("type", "object")
                             .put("properties", new JSONObject()
-                                    .put("path", field("string", "相对共享存储根目录的路径，如 ''、'DCIM/Camera'、'Pictures'、'Download'、'压缩用。'"))
+                                    .put("path", field("string", "相对共享存储根目录的路径，如 ''、'DCIM/Camera'、'Pictures'、'Download'、'Documents'"))
                                     .put("filter_type", field("string", "可选过滤：all / image / video / media / archive / document / dir"))
                                     .put("sort_by", field("string", "可选排序：mtime_desc（默认）/ mtime_asc / size_desc / name_asc"))
                                     .put("limit", field("integer", "返回条数上限（默认 100，最大 500）")));
@@ -333,7 +333,7 @@ public final class BridgeService extends Service {
                     JSONObject fsZipSchema = new JSONObject().put("type", "object")
                             .put("properties", new JSONObject()
                                     .put("sources", stringArrayField)
-                                    .put("zip_path", field("string", "输出的 .zip 文件路径，例如 '压缩用。/整理打包.zip'"))
+                                    .put("zip_path", field("string", "输出的 .zip 文件路径，例如 'Download/archive.zip'"))
                                     .put("compression_level", field("integer", "压缩级别 0-9，默认 1（兼顾速度与体积）")))
                             .put("required", new JSONArray().put("sources").put("zip_path"));
                     JSONObject fsUnzipSchema = new JSONObject().put("type", "object")
@@ -362,7 +362,7 @@ public final class BridgeService extends Service {
                             .put(tool("open_file_on_phone", "在手机屏幕上调用系统应用直接打开指定文件，并自动返回打开后的屏幕状态快照", fsPathSchema))
                             .put(tool("request_alarm", "直接设置手机系统闹钟，并自动读取系统 AlarmManager 核验真实生效的下一响铃时间（闭环验证）", alarmSchema))
                             .put(tool("list_installed_apps", "列出或搜索手机上已安装的应用名称与包名", listAppsSchema))
-                            .put(tool("open_app", "按应用中文名（如'微信'、'美团'、'设置'、'时钟'）或包名直接启动应用，等待加载后自动返回新页面快照", openAppSchema))
+                            .put(tool("open_app", "按应用名称（如'微信'、'浏览器'、'时钟'、'相册'）或包名直接启动应用，等待加载后自动返回新页面快照", openAppSchema))
                             .put(tool("request_screen_control", "请求开启或续期临时屏幕控制会话（默认需手机本机人工确认；若在设置中开启自动续期则自动激活）并返回当前屏幕快照", schema))
                             .put(tool("screen_observe", "获取目标屏幕的结构化快照（包含前台应用、窗口 ID、可见文本摘要、带 index 和 view_id 的可交互节点列表）", observeSchema))
                             .put(tool("screen_click_text", "【首选点击工具】按屏幕上的文字、按钮描述(desc)或控件id智能查找并点击，自动等待并返回点击后的最新页面快照与 ui_changed 状态", clickTextSchema))
@@ -621,17 +621,20 @@ public final class BridgeService extends Service {
                     try {
                         JSONObject a = req.getJSONObject("params").optJSONObject("arguments");
                         String tid = a != null ? a.optString("task_id", "") : "";
-                        result = textResult(TermuxCommandManager.status(BridgeService.this, tid).toString(), false);
+                        JSONObject resObj = TermuxCommandManager.status(BridgeService.this, tid);
+                        result = textResult(resObj.toString(), !resObj.optBoolean("ok", true));
                     } catch (Exception e) { result = classifiedErrorResult("termux_status", e); }
                 } else if ("tools/call".equals(method) && "termux_logs".equals(req.getJSONObject("params").getString("name"))) {
                     try {
                         JSONObject a = req.getJSONObject("params").getJSONObject("arguments");
-                        result = textResult(TermuxCommandManager.logs(BridgeService.this, a.getString("task_id"), a.optInt("tail_lines", 80)).toString(), false);
+                        JSONObject resObj = TermuxCommandManager.logs(BridgeService.this, a.getString("task_id"), a.optInt("tail_lines", 80));
+                        result = textResult(resObj.toString(), !resObj.optBoolean("ok", true));
                     } catch (Exception e) { result = classifiedErrorResult("termux_logs", e); }
                 } else if ("tools/call".equals(method) && "termux_stop".equals(req.getJSONObject("params").getString("name"))) {
                     try {
                         JSONObject a = req.getJSONObject("params").getJSONObject("arguments");
-                        result = textResult(TermuxCommandManager.stop(BridgeService.this, a.getString("task_id"), a.optInt("wait_ms", 4000)).toString(), false);
+                        JSONObject resObj = TermuxCommandManager.stop(BridgeService.this, a.getString("task_id"), a.optInt("wait_ms", 4000));
+                        result = textResult(resObj.toString(), !resObj.optBoolean("ok", false));
                     } catch (Exception e) { result = classifiedErrorResult("termux_stop", e); }
                 } else if ("tools/call".equals(method) && "album_summary".equals(req.getJSONObject("params").getString("name"))) {
                     try { result = textResult(new SystemTools(BridgeService.this).albumSummary().toString(), false); }
@@ -704,7 +707,8 @@ public final class BridgeService extends Service {
                     try {
                         ScreenControlService.authorized();
                         JSONObject a = req.getJSONObject("params").getJSONObject("arguments");
-                        result = textResult(new SystemTools(BridgeService.this).openFileOnPhone(a.getString("path")).toString(), false);
+                        JSONObject resObj = new SystemTools(BridgeService.this).openFileOnPhone(a.getString("path"));
+                        result = textResult(resObj.toString(), !resObj.optBoolean("launched_directly", true));
                     } catch (Exception e) { result = classifiedErrorResult("open_file_on_phone", e); }
                 } else {
                     JSONObject error = new JSONObject().put("jsonrpc", "2.0").put("id", req.get("id"))
@@ -722,7 +726,7 @@ public final class BridgeService extends Service {
         }
         private void addHtmlSecurityHeaders(Response r) {
             r.addHeader("Cache-Control", "no-store");
-            r.addHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+            r.addHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://chatgpt.com https://chat.openai.com https://claude.ai; frame-ancestors 'none'; base-uri 'none'");
             r.addHeader("X-Frame-Options", "DENY");
             r.addHeader("X-Content-Type-Options", "nosniff");
             r.addHeader("Referrer-Policy", "no-referrer");
@@ -799,7 +803,7 @@ public final class BridgeService extends Service {
         }
         private JSONObject tool(String name, String description, JSONObject schema) throws org.json.JSONException {
             boolean readOnly = java.util.Arrays.asList("list_calendars", "list_calendar_events", "list_file_roots", "list_root_files", "read_text_file", "album_summary", "fs_list_dir", "fs_search", "fs_read_text_path", "screen_observe", "phone_health", "list_displays", "shizuku_status", "termux_status", "termux_logs").contains(name);
-            boolean destructive = java.util.Arrays.asList("fs_delete", "fs_move", "fs_copy", "fs_write_text_path", "fs_zip", "fs_unzip", "screen_tap", "screen_swipe", "screen_set_text", "screen_back", "virtual_display_destroy", "termux_run", "termux_stop").contains(name);
+            boolean destructive = java.util.Arrays.asList("fs_delete", "fs_move", "fs_copy", "fs_write_text_path", "fs_zip", "fs_unzip", "screen_click_text", "screen_tap", "screen_swipe", "screen_set_text", "screen_back", "open_app", "open_app_on_display", "open_file_on_phone", "create_calendar_event", "request_alarm", "virtual_display_destroy", "termux_run", "termux_stop").contains(name);
             JSONObject annotations = new JSONObject()
                     .put("readOnlyHint", readOnly)
                     .put("destructiveHint", destructive)

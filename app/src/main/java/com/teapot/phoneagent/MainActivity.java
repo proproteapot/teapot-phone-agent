@@ -277,13 +277,27 @@ public final class MainActivity extends Activity {
         resetPairing.setText("重置连接码并吊销全部授权");
         resetPairing.setOnClickListener(v -> new android.app.AlertDialog.Builder(this)
                 .setTitle("确认重置连接码？")
-                .setMessage("重置后将生成全新的本机连接码，并立即吊销所有已签发的 OAuth 令牌。若使用了 Cloudflare 网关，需要同步更新 Worker 的 PHONE_SECRET。")
+                .setMessage("重置后将生成全新的本机连接码，暂停公网轮询并吊销已签发的 OAuth 令牌。若使用了 Cloudflare 网关，请同步更新 Worker 的 PHONE_SECRET（更新后云端也会自动作废所有旧 OAuth 令牌）。")
                 .setPositiveButton("确认重置", (d, w) -> {
+                    resetPairing.setEnabled(false);
+                    TunnelManager.stop();
                     new Thread(() -> {
-                        try { TunnelManager.revokeCloudOAuthTokens(this); } catch (Exception ignored) { }
+                        boolean cloudConfigured = !TunnelManager.getSavedCustomDomain(this).trim().isEmpty();
+                        boolean cloudOk = false;
+                        if (cloudConfigured) {
+                            try { cloudOk = TunnelManager.revokeCloudOAuthTokens(this); } catch (Exception ignored) { }
+                        }
                         new OAuthManager(this).rotatePairingTokenAndRevokeAll();
+                        final boolean cConf = cloudConfigured;
+                        final boolean cOk = cloudOk;
                         runOnUiThread(() -> {
-                            android.widget.Toast.makeText(this, "已生成新连接码并吊销全部授权，请更新云端 PHONE_SECRET", android.widget.Toast.LENGTH_LONG).show();
+                            resetPairing.setEnabled(true);
+                            String msg = !cConf
+                                    ? "已生成新连接码并吊销本机全部授权"
+                                    : (cOk
+                                    ? "已生成新连接码并吊销云端与本机授权；请更新云端 PHONE_SECRET 后再重连"
+                                    : "已生成新连接码并吊销本机授权；云端实时撤销未成功，请立即更新 Worker 的 PHONE_SECRET 以自动作废旧云端令牌");
+                            android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show();
                             refresh();
                         });
                     }).start();
@@ -308,8 +322,15 @@ public final class MainActivity extends Activity {
                 .setTitle("配置 Cloudflare 公网网关")
                 .setView(box)
                 .setPositiveButton("保存", (d, w) -> {
-                    TunnelManager.saveConfig(this, domainInput.getText().toString());
-                    android.widget.Toast.makeText(this, "已保存域名，点击「启动 / 重连服务」生效", android.widget.Toast.LENGTH_SHORT).show();
+                    String saved = TunnelManager.saveConfig(this, domainInput.getText().toString());
+                    if (saved == null) {
+                        android.widget.Toast.makeText(this, "地址无效：仅支持 HTTPS 根域名（如 https://xxx.workers.dev），禁止 http:// 或多余路径", android.widget.Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    String tip = saved.isEmpty()
+                            ? "已清空公网域名（切换为仅本机模式）"
+                            : "已保存网关：" + saved + "，点击「启动 / 重连服务」生效";
+                    android.widget.Toast.makeText(this, tip, android.widget.Toast.LENGTH_LONG).show();
                     refresh();
                 })
                 .setNegativeButton("取消", null)

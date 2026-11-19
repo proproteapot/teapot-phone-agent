@@ -66,14 +66,15 @@ ChatGPT / 远程 OAuth MCP 客户端                  本地桌面 MCP 客户端
 | **文件与相册** | `album_summary`, `fs_list_dir`, `fs_search`, `fs_mkdir`, `fs_move`, `fs_copy`, `fs_delete`, `fs_read_text_path`, `fs_write_text_path`, `fs_zip`, `fs_unzip`, `open_file_on_phone` | 完整共享存储与 SAF 文件管理，默认安全回收站与路径穿越防护 |
 | **日历与闹钟** | `list_calendars`, `list_calendar_events`, `create_calendar_event`, `request_alarm`, `list_installed_apps`, `open_app` | 日历读写、应用查询与闹钟设置闭环核验 |
 
-### 快速手动部署（3 分钟，0 费用，无需购买域名）
+### 快速手动部署（3 分钟，0 域名成本）
 
 > 💡 **托管方式三选一**：
 > 1. **Cloudflare 免费套餐自托管（推荐，$0 / 无需自购域名）**：Cloudflare Workers Free Plan 已支持 SQLite Durable Object 并赠送免费 `https://<worker>.<subdomain>.workers.dev` 域名。仓库已内置可直接部署的 `cloud/wrangler.jsonc`，执行 1 条命令即可拥有专属加密网关。
-> 2. **自定义域名托管（可选）**：复制 `cloud/wrangler.jsonc.example` 为 `cloud/wrangler.local.jsonc`（已被 `.gitignore` 忽略），填入自定义域名 `routes` 后部署。
+>    > ⚠️ **免费套餐配额提示**：当前公网通道采用 20 秒长轮询，若手机 24 小时全天常驻在线，单个 Durable Object 日消耗约 11,000 GB-s，较接近 Cloudflare Free Plan 每日 13,000 GB-s 免费时长上限；建议**按需启停**（后续版本计划迁移至 Durable Object WebSocket Hibernation API 以实现近零空闲消耗）。
+> 2. **自定义域名托管（可选）**：复制 `cloud/wrangler.jsonc.example` 为 `cloud/wrangler.local.jsonc`（已被 `.gitignore` 忽略），填入自定义域名 `routes`（以及按需追加 `ALLOWED_REDIRECT_HOSTS`）后部署。
 > 3. **纯本地 0 云端模式**：不部署任何云服务，直接通过 USB / ADB + `mcp-bridge/phone-mcp-stdio.mjs` 连接电脑端 MCP 客户端。
 >
-> 完整细节与 AI 自动执行步骤见 [AGENT_DEPLOY.md](AGENT_DEPLOY.md)。
+> **环境要求**：`Node.js >= 22.13`（Worker 单测依赖内置 `node:sqlite`）、`JDK 17+`、`Android SDK API 35`、`Android 11+ (API 30+)` 真机。完整细节与 AI 自动执行步骤见 [AGENT_DEPLOY.md](AGENT_DEPLOY.md)。
 
 1. **部署自托管 Cloudflare 网关（免费 `*.workers.dev`，0 域名成本）**：
    ```bash
@@ -81,26 +82,27 @@ ChatGPT / 远程 OAuth MCP 客户端                  本地桌面 MCP 客户端
    cd cloud && npm install
    npx wrangler deploy -c wrangler.jsonc
    ```
-   > 也可以直接在仓库页面点击 **Deploy to Cloudflare**（配置 Cloudflare 账号即可从仓库一键拉起 `cloud/wrangler.jsonc`）。
-2. **编译并安装 Android APK**（要求 JDK 17 + Android SDK API 35；日用建议打包签名 `assembleRelease`）：
+2. **编译并安装 Android APK**（`minSdk 30` / Android 11+；日用建议签名 Release 包）：
    ```bash
    ./gradlew assembleDebug --no-daemon
    adb install -r app/build/outputs/apk/debug/app-debug.apk
    ```
+   > 如需日用非调试版：执行 `./gradlew assembleRelease --no-daemon` 后，使用自建 keystore 通过 `apksigner` 签名 `app/build/outputs/apk/release/app-release-unsigned.apk` 再安装（仓库不包含私密签名密钥）。
 3. **配对与授权**：
-   - 在手机打开 App → 展开「设置与权限管理」→ 填入你的 Worker HTTPS 域名（如 `https://teapot-phone-agent.<your-subdomain>.workers.dev`）并复制连接码；
-   - 在电脑执行 `npx wrangler secret put PHONE_SECRET -c cloud/wrangler.jsonc` 粘贴该连接码；
-   - 在手机开启无障碍服务（如需离屏虚拟屏，先安装并激活 Shizuku 后在 App 主页点一键授权）；
+   - 在手机打开 App → 展开「设置与权限管理」→ 填入你的 Worker HTTPS 域名（如 `https://teapot-phone-agent.<your-subdomain>.workers.dev`，勿含 `/mcp`）并复制连接码；
+   - **先在电脑执行** `npx wrangler secret put PHONE_SECRET -c cloud/wrangler.jsonc` 粘贴该连接码；
+   - 在手机系统无障碍中开启 **「Teapot Phone-Agent 屏幕控制」**（若为手机端直接侧载安装，Android 13+ 需先在应用信息右上角启用「允许受限制的设置」；如需离屏虚拟屏，先安装并激活 Shizuku 后在 App 主页点一键授权，注意非 Root 下手机重启后需重新激活 Shizuku）；
    - 点击 **「启动 / 重连服务」**，使用 `curl -H "Authorization: Bearer <你的连接码>" https://<your-worker>/health` 确认 `phone_online: true`（匿名访问 `/health` 仅返回 `{ "ok": true, "service": "teapot-phone-agent" }`）。
 4. **接入客户端**：
-   - **ChatGPT 远程接入**：在 ChatGPT Settings → Apps / Connectors 中填入 `https://<your-worker>/mcp`，鉴权方式选 `OAuth`，授权页粘贴本机连接码即可。
+   - **远程 OAuth MCP（ChatGPT / Claude 等）**：在客户端 MCP 配置中填入 `https://<your-worker>/mcp`，鉴权方式选 `OAuth`，授权页粘贴本机连接码即可。如需接入其他远程 OAuth 客户端，请在 `cloud/wrangler.local.jsonc` 中配置 `ALLOWED_REDIRECT_HOSTS`。
    - **本地桌面 MCP 接入**：参考 [mcp_config.example.json](mcp-bridge/mcp_config.example.json) 配置 `PHONE_AGENT_TOKEN` 挂载 `mcp-bridge/phone-mcp-stdio.mjs`。
 
-### 真机实测记录
+### 真机实测与兼容性说明
 - 已在 **Redmi K80 Ultra（Android 16 / HyperOS OS3.0）** 上通过全链路真机验收：
   - `VirtualDisplayDaemon` 成功创建真离屏 `type VIRTUAL` 副屏（`FLAG_TRUSTED | FLAG_OWN_DISPLAY_GROUP | FLAG_ALWAYS_UNLOCKED`），系统浏览器、Chrome、夸克、Termux、QQ（`com.tencent.mobileqq`）均可在副屏独立运行且主屏完全不切换；
   - 副屏截图、控件 `view_id` 输入提交、副屏返回键、窗口变化守卫中止（`target_window_changed`）均通过；
-  - Termux 后台长期服务启动 → HTTP 探测就绪 → 进程组停止 → 重启恢复及断连 200ms 快返与重启后按原 `task_id` 续查均通过。
+  - Termux 后台长期服务启动 → HTTP 探测就绪 → 进程组停止 → 重启恢复及断连秒级快返与重启后按原 `task_id` 续查均通过。
+- **跨 ROM 兼容性提示**：`VirtualDisplayDaemon` 使用 `DisplayManagerGlobal` 隐藏 API 创建真离屏虚拟屏，不同厂商 ROM（如 Pixel / Samsung One UI / ColorOS）对 `uid=2000` 标志位策略可能存在差异；如遇不兼容欢迎提交机型反馈，失败时绝不会静默回退到主屏。目前手机 App 界面文案为简体中文。
 
 ---
 
@@ -127,12 +129,15 @@ Plug your Android phone in with USB debugging enabled and hand [AGENT_DEPLOY.md]
 Read AGENT_DEPLOY.md in this repo and deploy Teapot Phone-Agent to my Cloudflare account and connected Android device, then run end-to-end verification. Pause whenever manual login or on-device confirmation is required.
 ```
 
-### Quick Manual Setup (3 Minutes, $0 Hosting, No Custom Domain Needed)
+### Quick Manual Setup (3 Minutes, No Custom Domain Needed)
 
 > 💡 **Three Hosting Options**:
 > 1. **Cloudflare Free Plan (Recommended, $0 / No Domain Needed)**: Cloudflare Workers Free Plan includes SQLite Durable Objects and a free `https://<worker>.<subdomain>.workers.dev` HTTPS URL. The repo ships a ready-to-deploy `cloud/wrangler.jsonc`.
-> 2. **Custom Domain (Optional)**: Copy `cloud/wrangler.jsonc.example` to `cloud/wrangler.local.jsonc` (git-ignored) and add your custom `routes`.
+>    > ⚠️ **Free-Tier Duration Note**: Because the gateway currently uses 20s HTTP long-polling, keeping the phone online 24/7 consumes ~11,000 GB-s/day of Durable Object duration—close to Cloudflare Free Plan's 13,000 GB-s/day limit. Start/stop on demand; migrating to Durable Object WebSocket Hibernation API is planned for near-zero idle usage.
+> 2. **Custom Domain (Optional)**: Copy `cloud/wrangler.jsonc.example` to `cloud/wrangler.local.jsonc` (git-ignored) and add your custom `routes` (and optional `ALLOWED_REDIRECT_HOSTS`).
 > 3. **Zero-Cloud Local Mode**: Skip cloud deployment completely and connect desktop MCP clients over USB/ADB via `mcp-bridge/phone-mcp-stdio.mjs`.
+>
+> **Requirements**: `Node.js >= 22.13` (for built-in `node:sqlite` in Worker tests), `JDK 17+`, `Android SDK API 35`, and an **Android 11+ (API 30+)** device. Note: on-device Android UI strings are currently in Simplified Chinese.
 
 1. **Test & deploy the Cloudflare Worker gateway**:
    ```bash
@@ -140,18 +145,18 @@ Read AGENT_DEPLOY.md in this repo and deploy Teapot Phone-Agent to my Cloudflare
    cd cloud && npm install
    npx wrangler deploy -c wrangler.jsonc
    ```
-2. **Build & install the Android APK** (JDK 17 + Android SDK API 35; use signed `assembleRelease` for daily use):
+2. **Build & install the Android APK** (`minSdk 30` / Android 11+; sign `assembleRelease` with your own keystore via `apksigner` for daily non-debug use):
    ```bash
    ./gradlew assembleDebug --no-daemon
    adb install -r app/build/outputs/apk/debug/app-debug.apk
    ```
 3. **Pair & authorize on-device**:
-   - Open **Teapot Phone-Agent**, set your Worker HTTPS URL, and copy the hardware-encrypted pairing token.
-   - Run `npx wrangler secret put PHONE_SECRET -c cloud/wrangler.jsonc` and paste the pairing token.
-   - Enable Accessibility Service (and install/start Shizuku if using offscreen virtual displays).
-   - Tap **Start / Reconnect Service** and verify with `curl -H "Authorization: Bearer <PHONE_SECRET>" https://<your-worker>/health` that `phone_online: true` (anonymous `GET /health` returns only `{ "ok": true, "service": "teapot-phone-agent" }`).
+   - Open **Teapot Phone-Agent**, set your Worker HTTPS base URL (without `/mcp`), and copy the hardware-encrypted pairing token (`复制连接码`).
+   - Run `npx wrangler secret put PHONE_SECRET -c cloud/wrangler.jsonc` **before** starting the tunnel and paste the pairing token.
+   - Enable Accessibility Service (**Teapot Phone-Agent 屏幕控制**; on Android 13+ sideloaded APKs, enable Restricted Settings in App Info first). Install/start Shizuku if using offscreen virtual displays (non-root Shizuku must be restarted after phone reboots).
+   - Tap **Start / Reconnect Service** (`启动 / 重连服务`) and verify with `curl -H "Authorization: Bearer <PHONE_SECRET>" https://<your-worker>/health` that `phone_online: true` (anonymous `GET /health` returns only `{ "ok": true, "service": "teapot-phone-agent" }`).
 4. **Connect your MCP client**:
-   - **Remote OAuth MCP (e.g. ChatGPT)**: Add `https://<your-worker>/mcp` with `OAuth` authentication and enter your pairing token on the authorization page.
+   - **Remote OAuth MCP (ChatGPT / Claude / others)**: Add `https://<your-worker>/mcp` with `OAuth` authentication and enter your pairing token on the authorization page (extend `ALLOWED_REDIRECT_HOSTS` in `cloud/wrangler.local.jsonc` for other OAuth clients).
    - **Local Stdio MCP**: Configure `mcp-bridge/phone-mcp-stdio.mjs` with `PHONE_AGENT_TOKEN` using [mcp_config.example.json](mcp-bridge/mcp_config.example.json).
 
 ### Security & License

@@ -174,7 +174,7 @@ final class SystemTools {
 
     private File storageRoot() throws IOException {
         if (!Environment.isExternalStorageManager()) {
-            throw new SecurityException("尚未授予【所有文件访问权限】(MANAGE_EXTERNAL_STORAGE)，请在手机助手桥主界面点击授权");
+            throw new SecurityException("尚未授予【所有文件访问权限】(MANAGE_EXTERNAL_STORAGE)，请在 Teapot Phone-Agent 设置面板点击授权");
         }
         return Environment.getExternalStorageDirectory().getCanonicalFile();
     }

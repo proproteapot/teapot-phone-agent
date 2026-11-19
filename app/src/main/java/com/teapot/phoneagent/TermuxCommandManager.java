@@ -250,10 +250,10 @@ final class TermuxCommandManager {
         TASKS.put(taskId, record);
         persist(context);
 
-        int waitLimit = Math.max(500, Math.min(15000, waitMs));
+        int waitLimit = Math.max(500, Math.min(10000, waitMs));
         if ("service".equals(normalizedMode)) {
             String launchScript = buildServiceLaunchScript(record);
-            CallbackResult cb = execSync(context, launchScript, cleanWorkdir, taskId, Math.min(5000, waitLimit));
+            CallbackResult cb = execSync(context, launchScript, cleanWorkdir, taskId, Math.min(4000, waitLimit));
             if (cb == null) {
                 record.stage = "submitted";
             } else if (cb.err > 0) {

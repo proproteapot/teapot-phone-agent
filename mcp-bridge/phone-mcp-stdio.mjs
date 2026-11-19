@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 手机助手桥 (PhoneAgent) — 标准 MCP Stdio 桥接器
+ * Teapot Phone-Agent — 标准 MCP Stdio 桥接器
  *
  * 作用：
  * 将手机端运行的 `127.0.0.1:8765/mcp` (通过 ADB 转发到电脑 `127.0.0.1:18765/mcp`)
@@ -20,6 +20,20 @@ import readline from 'node:readline';
 const DEFAULT_PORT = 18765;
 const ENDPOINT = process.env.PHONE_AGENT_URL || `http://127.0.0.1:${DEFAULT_PORT}/mcp`;
 
+function resolveLocalForwardPort(endpointUrl) {
+  try {
+    const u = new URL(endpointUrl);
+    if (u.protocol === 'http:' && (u.hostname === '127.0.0.1' || u.hostname === 'localhost')) {
+      return Number(u.port || 80);
+    }
+  } catch {
+    // 忽略非法 URL，交给后续 fetch 报错
+  }
+  return null;
+}
+
+const LOCAL_FORWARD_PORT = resolveLocalForwardPort(ENDPOINT);
+
 function findAdb() {
   if (process.env.ADB_PATH && existsSync(process.env.ADB_PATH)) return process.env.ADB_PATH;
   const localAppData = process.env.LOCALAPPDATA || '';
@@ -34,11 +48,13 @@ function adbArgs(extra) {
 
 function ensureForwardAndToken() {
   const token = (process.env.PHONE_AGENT_TOKEN || '').trim();
-  const adb = findAdb();
-  try {
-    execFileSync(adb, adbArgs(['forward', `tcp:${DEFAULT_PORT}`, 'tcp:8765']), { stdio: 'ignore', timeout: 5000 });
-  } catch {
-    // 忽略：如果使用局域网/Tailscale URL 则无需 adb forward
+  if (LOCAL_FORWARD_PORT) {
+    const adb = findAdb();
+    try {
+      execFileSync(adb, adbArgs(['forward', `tcp:${LOCAL_FORWARD_PORT}`, 'tcp:8765']), { stdio: 'ignore', timeout: 5000 });
+    } catch {
+      // 忽略：若本机已有其他转发或 adb 未安装，由后续 HTTP 请求返回真实错误
+    }
   }
   return token;
 }
@@ -47,6 +63,17 @@ let cachedToken = ensureForwardAndToken();
 
 async function forwardRpc(message) {
   if (!cachedToken) cachedToken = ensureForwardAndToken();
+  if (!cachedToken) {
+    if (message.id === undefined) return null;
+    return {
+      jsonrpc: '2.0',
+      id: message.id ?? null,
+      error: {
+        code: -32002,
+        message: '未配置环境变量 PHONE_AGENT_TOKEN：请在手机 Teapot Phone-Agent 设置面板点击「复制连接码」并填入 MCP 配置。',
+      },
+    };
+  }
   const headers = {
     'Content-Type': 'application/json; charset=utf-8',
     'Authorization': `Bearer ${cachedToken}`,
@@ -56,7 +83,8 @@ async function forwardRpc(message) {
   try {
     res = await fetch(ENDPOINT, { method: 'POST', headers, body, signal: AbortSignal.timeout(25000) });
   } catch (err) {
-    // 尝试重新执行一次 adb forward 后重试
+    // 若使用本地回环地址，尝试重新执行一次 adb forward 后重试
+    if (!LOCAL_FORWARD_PORT) throw err;
     cachedToken = ensureForwardAndToken();
     headers['Authorization'] = `Bearer ${cachedToken}`;
     res = await fetch(ENDPOINT, { method: 'POST', headers, body, signal: AbortSignal.timeout(25000) });
@@ -69,11 +97,22 @@ async function forwardRpc(message) {
       id: message.id ?? null,
       error: {
         code: -32000,
-        message: `PhoneAgent HTTP ${res.status}: 请确认手机端「手机助手桥」已点击「启动本地测试服务」，且令牌正确。`,
+        message: `Teapot Phone-Agent HTTP ${res.status}: 请确认手机端已点击「启动 / 重连服务」或「仅启动本机服务 (127.0.0.1:8765)」，且 PHONE_AGENT_TOKEN 正确。`,
       },
     };
   }
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {
+      jsonrpc: '2.0',
+      id: message.id ?? null,
+      error: {
+        code: -32003,
+        message: `Teapot Phone-Agent 返回非 JSON 响应 (HTTP ${res.status})`,
+      },
+    };
+  }
 }
 
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
@@ -103,7 +142,7 @@ rl.on('line', (line) => {
         id: msg.id,
         error: {
           code: -32001,
-          message: `无法连接手机助手桥 (${ENDPOINT}): ${err.message}。请检查手机 USB/ADB 连接并确保「手机助手桥」本地服务处于运行中。`,
+          message: `无法连接 Teapot Phone-Agent (${ENDPOINT}): ${err.message}。请检查手机 USB/ADB 连接并确保本机服务处于运行中。`,
         },
       }) + '\n');
     }

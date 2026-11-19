@@ -479,7 +479,7 @@ final class ShizukuBridge {
 
     private static void ensurePrivilegedReady() {
         if (!isRunning()) throw new IllegalStateException("Shizuku 服务未启动，请在手机 Shizuku App 或通过 ADB 启动");
-        if (!isAuthorized()) throw new SecurityException("手机助手桥尚未获得 Shizuku 授权，请在手机上点击授权");
+        if (!isAuthorized()) throw new SecurityException("Teapot Phone-Agent 尚未获得 Shizuku 授权，请在手机上点击授权");
     }
 
     private static String resolveLauncherComponent(String pkg) {
@@ -533,16 +533,35 @@ final class ShizukuBridge {
 
     private static String runPrivilegedCmd(String... args) throws Exception {
         Process p = startPrivilegedProcess(args);
+        final boolean[] timedOut = { false };
+        Thread watchdog = new Thread(() -> {
+            try {
+                Thread.sleep(10000L);
+                if (p.isAlive()) {
+                    timedOut[0] = true;
+                    p.destroyForcibly();
+                }
+            } catch (InterruptedException ignored) { }
+        }, "shizuku-cmd-watchdog");
+        watchdog.setDaemon(true);
+        watchdog.start();
         StringBuilder sb = new StringBuilder();
-        try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = br.readLine()) != null) sb.append(line).append('\n');
+        try {
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = br.readLine()) != null) sb.append(line).append('\n');
+            }
+            try (BufferedReader eb = new BufferedReader(new InputStreamReader(p.getErrorStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = eb.readLine()) != null) sb.append(line).append('\n');
+            }
+            p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
+        } finally {
+            watchdog.interrupt();
         }
-        try (BufferedReader eb = new BufferedReader(new InputStreamReader(p.getErrorStream(), StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = eb.readLine()) != null) sb.append(line).append('\n');
+        if (timedOut[0]) {
+            throw new IllegalStateException("Shizuku 特权命令执行超时");
         }
-        p.waitFor();
         return sb.toString();
     }
 }

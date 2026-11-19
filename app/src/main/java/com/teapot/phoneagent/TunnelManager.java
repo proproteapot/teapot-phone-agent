@@ -27,9 +27,47 @@ final class TunnelManager {
     static volatile String statusText = "未启动";
     static volatile String publicUrl = "";
     private static volatile Context lastAppContext;
+    private static volatile HttpURLConnection activePollConn;
     private static final AtomicInteger generation = new AtomicInteger(0);
 
     private TunnelManager() { }
+
+    /**
+     * 规范化公网网关地址：
+     * - 允许空字符串（切换为仅本机模式）；
+     * - 缺少协议头时自动补全 https://，自动剥离误填的 /mcp 与尾部斜杠；
+     * - 显式拒绝 http:// 或非法 URI（返回 null）。
+     */
+    static String normalizeDomain(String raw) {
+        String s = raw == null ? "" : raw.trim();
+        if (s.isEmpty()) return "";
+        if (s.regionMatches(true, 0, "http://", 0, 7)) return null;
+        if (!s.contains("://")) s = "https://" + s;
+        try {
+            java.net.URI u = java.net.URI.create(s);
+            if (!"https".equalsIgnoreCase(u.getScheme())) return null;
+            if (u.getRawUserInfo() != null) return null;
+            String host = u.getHost();
+            if (host == null || host.isEmpty()) return null;
+            String path = u.getRawPath() == null ? "" : u.getRawPath().replaceAll("/+$", "");
+            if ("/mcp".equalsIgnoreCase(path)) path = "";
+            if (!path.isEmpty()) return null;
+            int port = u.getPort();
+            return "https://" + host + (port > 0 ? ":" + port : "");
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static void disconnectActivePollAsync() {
+        final HttpURLConnection conn = activePollConn;
+        activePollConn = null;
+        if (conn != null) {
+            new Thread(() -> {
+                try { conn.disconnect(); } catch (Exception ignored) { }
+            }, "poll-disconnect").start();
+        }
+    }
 
     static boolean revokeCloudOAuthTokens(Context context) throws Exception {
         String token = new OAuthManager(context).getOrCreatePairingToken();
@@ -65,12 +103,14 @@ final class TunnelManager {
         return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_CUSTOM_DOMAIN, "");
     }
 
-    static void saveConfig(Context ctx, String customDomain) {
-        String clean = customDomain == null ? "" : customDomain.trim().replaceAll("/+$", "");
+    static String saveConfig(Context ctx, String customDomain) {
+        String clean = normalizeDomain(customDomain);
+        if (clean == null) return null;
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .putString(KEY_CUSTOM_DOMAIN, clean)
                 .commit();
         publicUrl = clean;
+        return clean;
     }
 
     private static void persistRuntimeState(Context ctx) {
@@ -84,8 +124,9 @@ final class TunnelManager {
         final Context app = context.getApplicationContext();
         lastAppContext = app;
         final int gen = generation.incrementAndGet();
-        String hubBase = getSavedCustomDomain(app).trim().replaceAll("/+$", "");
-        if (hubBase.isEmpty() || !hubBase.startsWith("https://")) {
+        disconnectActivePollAsync();
+        String hubBase = normalizeDomain(getSavedCustomDomain(app));
+        if (hubBase == null || hubBase.isEmpty()) {
             running = false;
             publicUrl = "";
             statusText = "仅本机模式（请在设置中配置你的 Cloudflare Worker HTTPS 域名）";
@@ -101,12 +142,15 @@ final class TunnelManager {
 
     private static void runDirectPollLoop(Context app, String hubBase, int gen) {
         int consecutiveFailures = 0;
+        int consecutiveAuthFailures = 0;
         while (running && generation.get() == gen) {
+            HttpURLConnection conn = null;
             try {
                 ShizukuBridge.ensureAccessibilityRestoredIfOptedIn(app);
                 String token = new OAuthManager(app).getOrCreatePairingToken();
                 URL url = new URL(hubBase + "/_phone/poll");
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn = (HttpURLConnection) url.openConnection();
+                activePollConn = conn;
                 conn.setConnectTimeout(8000);
                 conn.setReadTimeout(26000);
                 conn.setRequestMethod("POST");
@@ -119,11 +163,14 @@ final class TunnelManager {
                 int code = conn.getResponseCode();
                 if (code == 200) {
                     consecutiveFailures = 0;
+                    consecutiveAuthFailures = 0;
                     publicUrl = hubBase;
                     statusText = "公网网关已连通 (" + hubBase.replaceFirst("^https://", "") + ")";
                     persistRuntimeState(app);
                     String body = readStream(conn.getInputStream());
                     conn.disconnect();
+                    if (activePollConn == conn) activePollConn = null;
+                    if (!running || generation.get() != gen) break;
                     JSONObject obj = new JSONObject(body);
                     if (obj.optBoolean("has_task", false)) {
                         final String taskId = obj.getString("id");
@@ -132,21 +179,46 @@ final class TunnelManager {
                     }
                 } else {
                     conn.disconnect();
+                    if (activePollConn == conn) activePollConn = null;
                     consecutiveFailures++;
                     if (code == 401) {
-                        statusText = "公网网关鉴权失败 (401)，请核对 PHONE_SECRET 与本机连接码一致";
+                        consecutiveAuthFailures++;
+                        if (consecutiveAuthFailures >= 3) {
+                            running = false;
+                            statusText = "公网网关鉴权连续失败 (401)，已暂停重试以避免触发 15 分钟 IP 锁定；请核对 PHONE_SECRET 后点击「启动 / 重连服务」";
+                            persistRuntimeState(app);
+                            break;
+                        }
+                        statusText = "公网网关鉴权失败 (401，第 " + consecutiveAuthFailures + " 次)，请核对 PHONE_SECRET 与本机连接码一致";
                         persistRuntimeState(app);
+                        Thread.sleep(10000L);
+                    } else if (code == 429) {
+                        statusText = "公网网关限流或 IP 已临时锁定 (429)，60 秒后重试";
+                        persistRuntimeState(app);
+                        Thread.sleep(60000L);
+                    } else if (code == 404) {
+                        statusText = "公网网关路径不存在 (404)，请确认域名正确且不含 /mcp 后缀";
+                        persistRuntimeState(app);
+                        Thread.sleep(30000L);
+                    } else {
+                        statusText = "公网网关返回异常 (HTTP " + code + ")，正在重试...";
+                        persistRuntimeState(app);
+                        Thread.sleep(Math.min(30000L, 2000L * consecutiveFailures));
                     }
-                    Thread.sleep(Math.min(5000L, 1000L * consecutiveFailures));
                 }
             } catch (Exception e) {
+                if (conn != null) {
+                    try { conn.disconnect(); } catch (Exception ignored) { }
+                    if (activePollConn == conn) activePollConn = null;
+                }
+                if (!running || generation.get() != gen) break;
                 consecutiveFailures++;
-                if (consecutiveFailures >= 3 && running && generation.get() == gen) {
+                if (consecutiveFailures >= 3) {
                     statusText = "正在重连公网网关...";
                     persistRuntimeState(app);
                 }
                 try {
-                    Thread.sleep(Math.min(5000L, 1000L * consecutiveFailures));
+                    Thread.sleep(Math.min(10000L, 1000L * consecutiveFailures));
                 } catch (InterruptedException ignored) {
                     break;
                 }
@@ -239,6 +311,7 @@ final class TunnelManager {
         running = false;
         generation.incrementAndGet();
         statusText = "已停止";
+        disconnectActivePollAsync();
         final Context app = lastAppContext;
         if (app != null) {
             new Thread(() -> notifyOffline(app), "notify-offline").start();

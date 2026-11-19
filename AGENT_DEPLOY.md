@@ -20,9 +20,9 @@
 
 ### Step 0：环境预检
 在仓库根目录执行只读探测，确认以下工具可用：
-- `node -v`（要求 >= 20）
-- `java -version`（要求 JDK 17）
-- `adb devices`（确认目标 Android 真机处于 `device` 状态）
+- `node -v`（要求 **>= 22.13**，因为 `cloud/worker.test.cjs` 使用 Node 内置 `node:sqlite`）
+- `java -version`（要求 JDK 17+）
+- `adb devices`（确认目标 **Android 11+ / API 30+** 真机处于 `device` 状态）
 - `npx wrangler whoami`（若未登录，暂停请用户手动执行 `npx wrangler login`；免费 Cloudflare 账号即可，**无需购买域名**）
 - 确认 `ANDROID_HOME` 指向已安装 Android SDK（API 35）的目录。
 
@@ -54,29 +54,43 @@
    ```bash
    adb shell pm grant com.teapot.phoneagent com.termux.permission.RUN_COMMAND
    ```
+   **必须同时在手机 Termux 中开启外部应用调用**（否则所有 `termux_run` 都会被 Termux 拒绝）：
+   ```bash
+   mkdir -p ~/.termux
+   grep -q '^allow-external-apps=true' ~/.termux/termux.properties 2>/dev/null || echo 'allow-external-apps=true' >> ~/.termux/termux.properties
+   termux-reload-settings
+   ```
 
 ### Step 3：Shizuku 环境准备（用于离屏虚拟屏）
+> 说明：非 Root 模式下，**手机重启后 Shizuku 服务会停止**，需要再次通过无线调试或下方 ADB 命令重新拉起。
 1. 检查手机是否已安装 Shizuku：
-   ```bash
-   adb shell pm list packages | grep shizuku
-   ```
+   - Linux / macOS：`adb shell pm list packages | grep shizuku`
+   - Windows PowerShell：`adb shell pm list packages | Select-String shizuku`
    - 若未安装，征得用户同意后从 `RikkaApps/Shizuku` 官方 Release 下载 APK 并 `adb install -r`。
 2. 通过 ADB 启动 Shizuku 服务（Shizuku v13.x）：
-   ```bash
-   APK_DIR=$(dirname "$(adb shell pm path moe.shizuku.privileged.api | sed 's/package://')")
-   adb shell "$APK_DIR/lib/arm64/libshizuku.so"
-   ```
-   验证 `adb shell ps -A | grep shizuku_server` 存在。
+   - Linux / macOS：
+     ```bash
+     APK_DIR=$(dirname "$(adb shell pm path moe.shizuku.privileged.api | sed 's/package://')")
+     adb shell "$APK_DIR/lib/arm64/libshizuku.so"
+     adb shell ps -A | grep shizuku_server
+     ```
+   - Windows PowerShell：
+     ```powershell
+     $apkPath = ((adb shell pm path moe.shizuku.privileged.api) -replace '^package:','').Trim()
+     $apkDir = $apkPath.Substring(0, $apkPath.LastIndexOf('/'))
+     adb shell "$apkDir/lib/arm64/libshizuku.so"
+     adb shell ps -A | Select-String shizuku_server
+     ```
 
 ### Step 4：引导用户完成手机本机配对与授权（暂停等待用户确认）
 请向用户清晰列出以下本机操作：
 1. 在手机打开 **Teapot Phone-Agent** → 展开「设置与权限管理」：
    - 点击 **「配置自托管 Cloudflare Worker 域名」**，填入 `<WORKER_URL>` 并保存；
    - 点击 **「复制连接码」**，并告知 Agent（或用户自己在电脑终端运行 `npx wrangler secret put PHONE_SECRET -c cloud/wrangler.jsonc` 粘贴该连接码，**推荐由用户直接在终端输入，不经对话暴露**）；
-   - 开启 **无障碍服务**（以及按需开启完整文件/日历/通知权限）；
+   - 在手机端开启无障碍服务：**「Teapot Phone-Agent 屏幕控制」**（若通过手机侧载而非 `adb install` 安装，Android 13+ 需先在系统「应用信息」右上角点「允许受限制的设置」；另按需开启完整文件/日历/通知权限）；
    - 如有 Shizuku，点击主页 **「★ 授权 Shizuku 离屏虚拟屏权限」** 并选择「始终允许」；
    - 按需决定是否开启高危安全开关（默认均关闭）：屏幕控制免确认自动续期、允许后台 Termux 命令执行、Shizuku 自动恢复被误杀的无障碍。
-2. 点击主页 **「启动 / 重连服务」**。
+2. **先完成 `PHONE_SECRET` 设置，再点击主页「启动 / 重连服务」**（若先启动再设密钥，连续 401 达 3 次手机端会自动暂停重试，核对密钥后再次点击即可）。
 
 ### Step 5：端到端验收
 1. **公网心跳验收**：
@@ -89,10 +103,11 @@
      curl -sL -H "Authorization: Bearer <PHONE_SECRET>" "<WORKER_URL>/health"
      ```
      确认返回 `phone_online: true`、`direct_online: true`、`poll_waiters >= 1`、`phone.accessibility_enabled: true`。
-2. **远程 MCP 接入（如 ChatGPT）**：
+2. **远程 MCP 接入（ChatGPT / Claude / 其他 OAuth 客户端）**：
    - 在 ChatGPT 网页端 → Settings → Apps / Connectors → Create：
      - MCP URL：`<WORKER_URL>/mcp`
      - Auth：`OAuth`
+   - 如需接入除 ChatGPT / Claude 以外的其他远程 OAuth MCP 客户端（如 Google Gemini 自定义连接器），在 `cloud/wrangler.local.jsonc` 的 `vars.ALLOWED_REDIRECT_HOSTS` 中显式追加目标回调域名并重新部署（示例见 `cloud/wrangler.jsonc.example`）。
    - 在弹出的授权页粘贴手机端复制的连接码完成绑定。
 3. **本地 Stdio MCP 接入（可选）**：
    参考 `mcp-bridge/mcp_config.example.json`，设置环境变量 `PHONE_AGENT_TOKEN` 后挂载 `mcp-bridge/phone-mcp-stdio.mjs`。
@@ -104,14 +119,14 @@
 > This section is written directly for **AI Coding Agents** (Claude Code, Codex, Antigravity, Cursor, etc.) executing deployment on behalf of a user.
 
 ### ⚠️ Agent Guardrails (Mandatory)
-1. **Never log, print, or commit secrets**: Never echo `PHONE_SECRET`, pairing tokens, OAuth tokens, or private `cloud/wrangler.jsonc` files into logs, chat responses, or git commits.
+1. **Never log, print, or commit secrets**: Never echo `PHONE_SECRET`, pairing tokens, OAuth tokens, or private `cloud/wrangler.local.jsonc` files into logs, chat responses, or git commits.
 2. **Respect human-in-the-loop boundaries**: `wrangler login`, Android Accessibility opt-in, Shizuku permission grant, opting into high-privilege toggles, and OAuth browser approval must be performed by the user.
 3. **Do not weaken security controls**: Keep S256 PKCE, `Origin` checks, `redirect_uri` allowlisting, `network_security_config.xml`, and minimal `/health` output intact.
 
 ### Step 0: Preflight Checks
 Verify locally:
-- `node -v` (>= 20), `java -version` (JDK 17), `ANDROID_HOME` (Android SDK API 35)
-- `adb devices` shows target device as `device`
+- `node -v` (**>= 22.13**, required for built-in `node:sqlite` in `cloud/worker.test.cjs`), `java -version` (JDK 17+), `ANDROID_HOME` (Android SDK API 35)
+- `adb devices` shows target **Android 11+ (API 30+)** device as `device`
 - `npx wrangler whoami` (if unauthenticated, pause and ask the user to run `npx wrangler login`)
 
 ### Step 1: Test & Deploy Cloudflare Worker Gateway (Free `*.workers.dev`, $0)
@@ -139,26 +154,41 @@ Optional (if user uses Termux background tasks):
 ```bash
 adb shell pm grant com.teapot.phoneagent com.termux.permission.RUN_COMMAND
 ```
+And inside Termux on the phone, enable external app execution (required by Termux, otherwise `termux_run` is rejected):
+```bash
+mkdir -p ~/.termux
+grep -q '^allow-external-apps=true' ~/.termux/termux.properties 2>/dev/null || echo 'allow-external-apps=true' >> ~/.termux/termux.properties
+termux-reload-settings
+```
 
 ### Step 3: Set Up Shizuku (For Offscreen Virtual Display)
-1. Check `adb shell pm list packages | grep shizuku`. If missing, ask user permission to install official Shizuku APK from `RikkaApps/Shizuku`.
+> Note: Without root, Shizuku stops after a phone reboot and must be started again via Wireless Debugging or ADB.
+1. Check if Shizuku is installed (`adb shell pm list packages | grep shizuku` on Linux/macOS, or `Select-String shizuku` on Windows PowerShell). If missing, ask user permission to install official Shizuku APK from `RikkaApps/Shizuku`.
 2. Start Shizuku server via ADB:
-   ```bash
-   APK_DIR=$(dirname "$(adb shell pm path moe.shizuku.privileged.api | sed 's/package://')")
-   adb shell "$APK_DIR/lib/arm64/libshizuku.so"
-   ```
-   Verify `shizuku_server` is running via `adb shell ps -A | grep shizuku_server`.
+   - Linux / macOS:
+     ```bash
+     APK_DIR=$(dirname "$(adb shell pm path moe.shizuku.privileged.api | sed 's/package://')")
+     adb shell "$APK_DIR/lib/arm64/libshizuku.so"
+     adb shell ps -A | grep shizuku_server
+     ```
+   - Windows PowerShell:
+     ```powershell
+     $apkPath = ((adb shell pm path moe.shizuku.privileged.api) -replace '^package:','').Trim()
+     $apkDir = $apkPath.Substring(0, $apkPath.LastIndexOf('/'))
+     adb shell "$apkDir/lib/arm64/libshizuku.so"
+     adb shell ps -A | Select-String shizuku_server
+     ```
 
 ### Step 4: Human-in-the-Loop On-Device Pairing (Pause for User)
 Guide the user to:
-1. Open **Teapot Phone-Agent** on Android → expand Settings:
+1. Open **Teapot Phone-Agent** on Android → expand Settings (note: on-device UI labels are currently in Simplified Chinese):
    - Configure the Cloudflare Worker HTTPS domain (`<WORKER_URL>`).
-   - Tap **Copy Pairing Token** and run `npx wrangler secret put PHONE_SECRET -c cloud/wrangler.jsonc` directly in their terminal to paste it securely.
-   - Enable Accessibility Service (and optional Storage/Calendar/Notification permissions).
+   - Tap **Copy Pairing Token** (`复制连接码`) and run `npx wrangler secret put PHONE_SECRET -c cloud/wrangler.jsonc` directly in their terminal **before** starting the tunnel.
+   - Enable Accessibility Service (**Teapot Phone-Agent 屏幕控制**; on Android 13+ sideloaded APKs, allow Restricted Settings in App Info first) and optional Storage/Calendar/Notification permissions.
    - Grant Shizuku permission via the on-screen button if using offscreen virtual display.
    - Optionally opt into high-privilege toggles (disabled by default): screen auto-renewal, Termux background execution, Shizuku accessibility auto-restore.
-2. Tap **Start / Reconnect Service**.
+2. Tap **Start / Reconnect Service** (`启动 / 重连服务`).
 
 ### Step 5: End-to-End Verification
 1. Verify anonymous `GET <WORKER_URL>/health` returns `{ "ok": true, "service": "teapot-phone-agent" }`, and authenticated `GET <WORKER_URL>/health` (with `Authorization: Bearer <PHONE_SECRET>`) returns `phone_online: true`, `direct_online: true`, `poll_waiters >= 1`.
-2. Connect ChatGPT (or any OAuth 2.0 + PKCE MCP client) to `<WORKER_URL>/mcp`, or mount `mcp-bridge/phone-mcp-stdio.mjs` locally with `PHONE_AGENT_TOKEN`.
+2. Connect ChatGPT or Claude to `<WORKER_URL>/mcp` via OAuth (for other remote OAuth MCP clients, add their callback hostname to `ALLOWED_REDIRECT_HOSTS` as shown in `cloud/wrangler.jsonc.example`), or mount `mcp-bridge/phone-mcp-stdio.mjs` locally with `PHONE_AGENT_TOKEN`.

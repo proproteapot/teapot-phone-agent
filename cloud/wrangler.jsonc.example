@@ -11,6 +11,11 @@
   // "routes": [
   //   { "pattern": "phone.example.com", "custom_domain": true }
   // ],
+  // 可选：如需接入 ChatGPT / Claude 以外的远程 OAuth MCP 客户端，显式追加允许的回调主机名（逗号分隔）
+  // Optional: comma-separated extra HTTPS redirect hosts for additional OAuth MCP clients
+  // "vars": {
+  //   "ALLOWED_REDIRECT_HOSTS": "gemini.google.com"
+  // },
   "durable_objects": {
     "bindings": [
       { "name": "PHONE_HUB", "class_name": "PhoneHub" }
