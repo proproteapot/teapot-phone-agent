@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "teapot-phone-agent": {
+      "command": "node",
+      "args": [
+        "/path/to/teapot-phone-agent/mcp-bridge/phone-mcp-stdio.mjs"
+      ],
+      "env": {
+        "PHONE_AGENT_URL": "http://127.0.0.1:18765/mcp",
+        "PHONE_AGENT_TOKEN": "<PASTE_PAIRING_TOKEN_FROM_APP>"
+      }
+    }
+  }
+}

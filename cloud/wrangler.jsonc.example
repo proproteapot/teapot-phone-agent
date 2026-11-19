@@ -1,0 +1,22 @@
+{
+  "name": "teapot-phone-agent",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-13",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": { "enabled": false },
+  // 可选：如需绑定自有域名，请取消下方注释并改为你的域名
+  // Optional: uncomment and set your custom domain if desired
+  // "routes": [
+  //   { "pattern": "phone.example.com", "custom_domain": true }
+  // ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "PHONE_HUB", "class_name": "PhoneHub" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["PhoneHub"] }
+  ]
+}
