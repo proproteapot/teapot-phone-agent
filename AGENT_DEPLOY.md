@@ -107,7 +107,7 @@
    - 在 ChatGPT 网页端 → Settings → Apps / Connectors → Create：
      - MCP URL：`<WORKER_URL>/mcp`
      - Auth：`OAuth`
-   - 如需接入除 ChatGPT / Claude 以外的其他远程 OAuth MCP 客户端（如 Google Gemini 自定义连接器），在 `cloud/wrangler.local.jsonc` 的 `vars.ALLOWED_REDIRECT_HOSTS` 中显式追加目标回调域名并重新部署（示例见 `cloud/wrangler.jsonc.example`）。
+   - 如需接入除 ChatGPT / Claude 以外的其他远程 OAuth MCP 客户端，可在 `cloud/wrangler.local.jsonc` 的 `vars.ALLOWED_REDIRECT_HOSTS` 中显式追加目标回调域名并重新部署（示例见 `cloud/wrangler.jsonc.example`）。
    - 在弹出的授权页粘贴手机端复制的连接码完成绑定。
 3. **本地 Stdio MCP 接入（可选）**：
    参考 `mcp-bridge/mcp_config.example.json`，设置环境变量 `PHONE_AGENT_TOKEN` 后挂载 `mcp-bridge/phone-mcp-stdio.mjs`。
