@@ -1,0 +1,16 @@
+Teapot Phone-Agent
+Copyright 2026 Teapot Phone-Agent Contributors
+
+This product includes third-party open-source software:
+
+1. NanoHTTPD (org.nanohttpd:nanohttpd:2.3.1)
+   License: BSD-3-Clause
+   https://github.com/NanoHttpd/nanohttpd
+
+2. Shizuku API & Provider (dev.rikka.shizuku:api:13.1.5, dev.rikka.shizuku:provider:13.1.5)
+   License: MIT
+   https://github.com/RikkaApps/Shizuku-API
+
+3. JUnit 4 (junit:junit:4.13.2, test scope only)
+   License: Eclipse Public License 1.0 (EPL-1.0)
+   https://junit.org/junit4/

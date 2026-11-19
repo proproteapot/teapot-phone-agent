@@ -1,0 +1,12 @@
+{
+  "name": "teapot-phone-agent-gateway",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "test": "node --test worker.test.cjs",
+    "deploy": "wrangler deploy -c wrangler.jsonc"
+  },
+  "devDependencies": {
+    "wrangler": "4.165.0"
+  }
+}

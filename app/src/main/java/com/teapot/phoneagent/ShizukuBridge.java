@@ -209,8 +209,11 @@ final class ShizukuBridge {
      * 创建真正的离屏虚拟屏（type=VIRTUAL，主屏零遮挡）。
      * 严禁静默降级为遮挡主屏的 overlay_display_devices。
      */
-    static JSONObject createVirtualDisplay(int width, int height, int densityDpi) throws Exception {
+    static synchronized JSONObject createVirtualDisplay(int width, int height, int densityDpi) throws Exception {
         ensurePrivilegedReady();
+        if (MANAGED_DISPLAYS.size() >= 2) {
+            throw new IllegalStateException("最多同时托管 2 个离屏虚拟屏，请先调用 virtual_display_destroy 释放已有虚拟屏");
+        }
         int w = Math.max(480, Math.min(2560, width <= 0 ? 1080 : width));
         int h = Math.max(640, Math.min(3200, height <= 0 ? 2400 : height));
         int dpi = Math.max(160, Math.min(640, densityDpi <= 0 ? 420 : densityDpi));
@@ -328,16 +331,23 @@ final class ShizukuBridge {
         if (pkg == null || !pkg.matches("[a-zA-Z0-9._]+")) {
             throw new IllegalArgumentException("非法包名: " + pkg);
         }
+        if (ScreenControlService.isProtectedPackage(pkg)) {
+            throw new SecurityException("禁止通过远程虚拟屏启动受保护系统/安全应用：" + pkg);
+        }
         List<String> cmd = new ArrayList<>();
         cmd.add("am");
         cmd.add("start");
         cmd.add("--display");
         cmd.add(String.valueOf(displayId));
         if (dataUri != null && !dataUri.trim().isEmpty()) {
+            String cleanUrl = sanitizeHttpUrl(dataUri);
+            String cleanAction = (action == null || action.trim().isEmpty() || "android.intent.action.VIEW".equals(action.trim()))
+                    ? "android.intent.action.VIEW" : null;
+            if (cleanAction == null) throw new SecurityException("仅允许 android.intent.action.VIEW 动作打开网页 URL");
             cmd.add("-a");
-            cmd.add((action != null && !action.trim().isEmpty()) ? action.trim() : "android.intent.action.VIEW");
+            cmd.add(cleanAction);
             cmd.add("-d");
-            cmd.add(dataUri.trim());
+            cmd.add(cleanUrl);
             cmd.add(pkg);
         } else {
             String resolved = resolveLauncherComponent(pkg);
@@ -443,6 +453,28 @@ final class ShizukuBridge {
             }
         } catch (Exception ignored) { }
         return out;
+    }
+
+    static String sanitizeHttpUrl(String raw) {
+        String s = raw == null ? "" : raw.trim();
+        if (s.isEmpty() || s.startsWith("-") || s.length() > 2048) {
+            throw new SecurityException("URL 格式不合法或过长");
+        }
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c <= 0x1F || c == 0x7F || Character.isWhitespace(c)) {
+                throw new SecurityException("URL 不得包含控制字符或空白字符");
+            }
+        }
+        java.net.URI u = java.net.URI.create(s);
+        String scheme = u.getScheme() == null ? "" : u.getScheme().toLowerCase(Locale.ROOT);
+        if (!"http".equals(scheme) && !"https".equals(scheme)) {
+            throw new SecurityException("仅允许 http:// 或 https:// 协议的 URL");
+        }
+        if (u.getHost() == null || u.getHost().isEmpty()) {
+            throw new SecurityException("URL 缺少有效主机名");
+        }
+        return s;
     }
 
     private static void ensurePrivilegedReady() {

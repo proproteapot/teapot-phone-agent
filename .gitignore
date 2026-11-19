@@ -3,7 +3,8 @@
 local.properties
 **/build/
 **/.wrangler/
-cloud/wrangler.jsonc
+cloud/wrangler.local.jsonc
+cloud/node_modules/
 cloud/.dev.vars
 *.keystore
 *.jks

@@ -2,6 +2,7 @@ package com.teapot.phoneagent;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.KeyguardManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -11,23 +12,27 @@ import android.content.Intent;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import java.security.SecureRandom;
 
 /**
  * 屏幕控制会话与本机人工确认管理：
- * 默认采用「严格本机确认模式」——远程 Agent 首次请求屏幕控制时，必须在手机本机点击通知或主页按钮批准；
- * 用户也可在手机本机设置中显式开启「2 分钟受控自动续期模式」。
- * 控制期间右上角常驻可随时停止的红色悬浮条，息屏或锁屏立即自动撤销。
+ * - 默认「严格本机确认模式」：首次请求必须由用户在本机点击批准，单次会话无操作超时 2 分钟、绝对总上限 10 分钟；
+ * - 可选「宽松自动续期模式」：用户可在手机设置中显式开启；
+ * - 任何模式下，锁屏或息屏均强制拒绝激活并立即撤销现有会话。
  */
 public final class ScreenApprovalActivity extends Activity {
     static final int APPROVAL_NOTIFICATION_ID = 6409;
+    private static final long IDLE_TIMEOUT_MS = 120000L;
+    private static final long HARD_CAP_MS = 10 * 60 * 1000L;
     private static final String PREFS = "screen_approval_prefs";
     private static final String KEY_AUTO_APPROVE = "auto_approve_enabled";
     private static final String CHANNEL_APPROVAL = "screen_approval";
     private static final SecureRandom RNG = new SecureRandom();
 
     static volatile long expiresAt;
+    static volatile long sessionHardCapAt;
     static volatile String pendingRequest;
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
 
@@ -40,10 +45,12 @@ public final class ScreenApprovalActivity extends Activity {
         }
         new AlertDialog.Builder(this)
                 .setTitle("允许远程 Agent 临时控制屏幕？")
-                .setMessage("批准后将开启 2 分钟限时屏幕控制会话；控制期间顶部常驻红色停止条，息屏或锁屏立即自动撤销。")
+                .setMessage("批准后将开启临时屏幕控制会话（无操作 2 分钟结束，单次最长 10 分钟）；控制期间顶部常驻红色停止条，息屏或锁屏立即自动撤销。")
                 .setCancelable(false)
-                .setPositiveButton("批准（2 分钟）", (d, w) -> {
-                    grantSession(this);
+                .setPositiveButton("批准", (d, w) -> {
+                    try {
+                        grantSession(this, true);
+                    } catch (Exception ignored) { }
                     finish();
                 })
                 .setNegativeButton("拒绝", (d, w) -> {
@@ -67,31 +74,42 @@ public final class ScreenApprovalActivity extends Activity {
                 .edit().putBoolean(KEY_AUTO_APPROVE, enabled).commit();
     }
 
+    static void checkDeviceUnlocked(Context context) {
+        Context app = context.getApplicationContext();
+        KeyguardManager guard = (KeyguardManager) app.getSystemService(KEYGUARD_SERVICE);
+        PowerManager power = (PowerManager) app.getSystemService(POWER_SERVICE);
+        if ((guard != null && guard.isDeviceLocked()) || (power != null && !power.isInteractive())) {
+            end(app, "手机已锁屏或息屏");
+            throw new SecurityException("手机当前处于锁屏或息屏状态，拒绝执行屏幕或虚拟屏操作");
+        }
+    }
+
     static boolean allowed() {
-        return SystemClock.elapsedRealtime() < expiresAt;
+        long now = SystemClock.elapsedRealtime();
+        return now < expiresAt && (sessionHardCapAt == 0 || now < sessionHardCapAt);
     }
 
     static void revoke() {
         expiresAt = 0;
+        sessionHardCapAt = 0;
         pendingRequest = null;
     }
 
-    /**
-     * 检查屏幕控制授权：
-     * - 若当前在有效 2 分钟会话内：直接放行并续期；
-     * - 若用户已在手机端显式开启自动续期模式：激活会话；
-     * - 否则（默认严格模式）：发送本机批准通知并抛出 SecurityException，等待用户手动批准。
-     */
     static synchronized void requireOrActivate(Context context) {
+        checkDeviceUnlocked(context);
         if (ScreenControlService.instance == null) {
             throw new SecurityException("无障碍服务未启用");
         }
-        if (allowed() || isAutoApproveEnabled(context)) {
-            grantSession(context);
+        if (allowed()) {
+            grantSession(context, false);
+            return;
+        }
+        if (isAutoApproveEnabled(context)) {
+            grantSession(context, true);
             return;
         }
         requestManualApproval(context);
-        throw new SecurityException("屏幕控制需要手机本机批准：已向手机发送批准通知（也可在「手机助手桥」主页点击批准按钮，或在设置中开启自动续期模式）。");
+        throw new SecurityException("屏幕控制需要手机本机批准：已向手机发送批准通知（也可在主页点击批准按钮，或在设置中开启宽松自动续期模式）。");
     }
 
     static synchronized void autoActivate(Context context) {
@@ -116,7 +134,7 @@ public final class ScreenApprovalActivity extends Activity {
             Notification n = new Notification.Builder(app, CHANNEL_APPROVAL)
                     .setSmallIcon(android.R.drawable.ic_dialog_alert)
                     .setContentTitle("Agent 请求临时屏幕控制")
-                    .setContentText("点击批准或拒绝（2 分钟限时）")
+                    .setContentText("点击批准或拒绝（单次最长 10 分钟）")
                     .setContentIntent(pi)
                     .setAutoCancel(true)
                     .build();
@@ -124,16 +142,24 @@ public final class ScreenApprovalActivity extends Activity {
         } catch (Exception ignored) { }
     }
 
-    private static synchronized void grantSession(Context context) {
+    private static synchronized void grantSession(Context context, boolean freshGrant) {
+        checkDeviceUnlocked(context);
         if (ScreenControlService.instance == null) {
             throw new IllegalStateException("无障碍服务未启用");
         }
         pendingRequest = null;
         NotificationManager nm = context.getSystemService(NotificationManager.class);
         if (nm != null) nm.cancel(APPROVAL_NOTIFICATION_ID);
+
+        long now = SystemClock.elapsedRealtime();
         final boolean wasAllowed = allowed();
-        expiresAt = SystemClock.elapsedRealtime() + 120000L;
+        if (freshGrant || sessionHardCapAt == 0 || now >= sessionHardCapAt) {
+            sessionHardCapAt = now + HARD_CAP_MS;
+        }
+        long nextExpiry = Math.min(now + IDLE_TIMEOUT_MS, sessionHardCapAt);
+        expiresAt = nextExpiry;
         final long expectedExpiry = expiresAt;
+        final long delayMs = Math.max(1000L, nextExpiry - now);
         final Context appCtx = context.getApplicationContext();
         MAIN.post(() -> {
             if (ScreenControlService.instance != null && !wasAllowed) {
@@ -144,7 +170,7 @@ public final class ScreenApprovalActivity extends Activity {
             if (expiresAt == expectedExpiry) {
                 end(appCtx, "临时控制会话已到期");
             }
-        }, 120000L);
+        }, delayMs);
     }
 
     static void end(Context context, String reason) {

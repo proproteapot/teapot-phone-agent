@@ -55,13 +55,13 @@ public final class BridgeService extends Service {
     @Override public IBinder onBind(Intent intent) { return null; }
 
     private final class LocalServer extends NanoHTTPD {
+        private static final long MAX_OAUTH_BODY_BYTES = 16384L;
+        private static final long MAX_MCP_BODY_BYTES = 262144L;
         private final OAuthManager oauth;
         LocalServer(OAuthManager oauth) { super("127.0.0.1", 8765); this.oauth = oauth; }
         @Override public Response serve(IHTTPSession session) {
             if (session.getMethod() == Method.OPTIONS) {
-                Response r = newFixedLengthResponse(Response.Status.NO_CONTENT, "text/plain", "");
-                addCorsHeaders(r);
-                return r;
+                return response(Response.Status.METHOD_NOT_ALLOWED, "{}");
             }
             String reqPath = session.getUri();
             Method httpMethod = session.getMethod();
@@ -74,17 +74,33 @@ public final class BridgeService extends Service {
                     return response(Response.Status.OK, OAuthManager.buildAuthServerMeta(baseUrl).toString());
                 }
                 if (httpMethod == Method.POST && "/oauth/register".equals(reqPath)) {
+                    if (!checkContentLength(session, MAX_OAUTH_BODY_BYTES)) return response(Response.Status.BAD_REQUEST, "{}");
                     Map<String, String> body = new java.util.HashMap<>();
                     session.parseBody(body);
                     return response(Response.Status.CREATED, oauth.registerClient(body.get("postData")).toString());
                 }
                 if (httpMethod == Method.GET && "/oauth/authorize".equals(reqPath)) {
                     Map<String, String> q = new java.util.HashMap<>(session.getParms());
+                    if (!OAuthManager.isAllowedCallback(q.get("redirect_uri"))
+                            || !OAuthManager.isValidS256Challenge(q.get("code_challenge"), q.get("code_challenge_method"))) {
+                        return response(Response.Status.BAD_REQUEST, "{\"error\":\"invalid_request\"}");
+                    }
                     Response r = newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", oauth.renderAuthorizeHtml(q));
-                    r.addHeader("Cache-Control", "no-store");
+                    addHtmlSecurityHeaders(r);
                     return r;
                 }
                 if (httpMethod == Method.POST && "/oauth/authorize".equals(reqPath)) {
+                    if (!checkContentLength(session, MAX_OAUTH_BODY_BYTES)) return response(Response.Status.BAD_REQUEST, "{}");
+                    String origin = session.getHeaders().get("origin");
+                    if (origin != null && !origin.isEmpty() && !isAllowedLocalOrigin(origin, baseUrl)) {
+                        return response(Response.Status.FORBIDDEN, "{\"error\":\"invalid_origin\"}");
+                    }
+                    if (OAuthManager.isLocalAuthLocked()) {
+                        Response locked = newFixedLengthResponse(status429(), "text/html; charset=utf-8",
+                                "<!doctype html><meta charset='utf-8'><h3>尝试次数过多，请 15 分钟后再试或在手机应用中重置连接码。</h3>");
+                        addHtmlSecurityHeaders(locked);
+                        return locked;
+                    }
                     Map<String, String> params = parseAllParams(session);
                     String secret = params.get("secret");
                     String pairing = oauth.getOrCreatePairingToken();
@@ -92,14 +108,15 @@ public final class BridgeService extends Service {
                     boolean secretOk = secret != null && MessageDigest.isEqual(
                             pairing.getBytes(java.nio.charset.StandardCharsets.UTF_8),
                             secret.trim().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    OAuthManager.recordLocalAuthAttempt(csrfOk && secretOk);
                     if (!csrfOk || !secretOk) {
                         Response denied = newFixedLengthResponse(Response.Status.FORBIDDEN, "text/html; charset=utf-8",
-                                "<!doctype html><meta charset='utf-8'><h3>授权失败：本机服务令牌不匹配或页面已过期，请返回重试。</h3>");
-                        denied.addHeader("Cache-Control", "no-store");
+                                "<!doctype html><meta charset='utf-8'><h3>授权失败：本机连接码不匹配或页面已过期，请返回重试。</h3>");
+                        addHtmlSecurityHeaders(denied);
                         return denied;
                     }
                     String redirectUri = params.get("redirect_uri");
-                    if (redirectUri == null || redirectUri.isEmpty()) return response(Response.Status.BAD_REQUEST, "{}");
+                    if (!OAuthManager.isAllowedCallback(redirectUri)) return response(Response.Status.BAD_REQUEST, "{}");
                     String code = oauth.issueAuthCode(redirectUri, params.get("code_challenge"), params.get("code_challenge_method"));
                     android.net.Uri.Builder loc = android.net.Uri.parse(redirectUri).buildUpon().appendQueryParameter("code", code);
                     String state = params.get("state");
@@ -110,6 +127,7 @@ public final class BridgeService extends Service {
                     return redirect;
                 }
                 if (httpMethod == Method.POST && "/oauth/token".equals(reqPath)) {
+                    if (!checkContentLength(session, MAX_OAUTH_BODY_BYTES)) return response(Response.Status.BAD_REQUEST, "{}");
                     try {
                         Map<String, String> params = parseAllParams(session);
                         return response(Response.Status.OK, oauth.exchangeToken(params).toString());
@@ -132,8 +150,7 @@ public final class BridgeService extends Service {
             if (httpMethod == Method.DELETE) return response(Response.Status.OK, "{}");
             if (httpMethod != Method.POST) return response(Response.Status.METHOD_NOT_ALLOWED, "{}");
             try {
-                String len = session.getHeaders().get("content-length");
-                if (len == null || Long.parseLong(len) > 65536 || Long.parseLong(len) < 0) return response(Response.Status.BAD_REQUEST, "{}");
+                if (!checkContentLength(session, MAX_MCP_BODY_BYTES)) return response(Response.Status.BAD_REQUEST, "{}");
                 Map<String, String> body = new java.util.HashMap<>(); session.parseBody(body);
                 JSONObject req = new JSONObject(body.get("postData"));
                 String method = req.getString("method");
@@ -260,7 +277,7 @@ public final class BridgeService extends Service {
                                     .put("command", field("string", "要在 Termux 中后台执行的 bash 命令"))
                                     .put("workdir", field("string", "工作目录，默认 /data/data/com.termux/files/home"))
                                     .put("mode", field("string", "任务模式：'oneshot'（默认，一次性命令）或 'service'（长期服务）"))
-                                    .put("service_name", field("string", "可选：长期服务名称，如 'SillyTavern'"))
+                                    .put("service_name", field("string", "可选：长期服务名称，如 'my-web-server'"))
                                     .put("probe_url", field("string", "可选：本机 HTTP 就绪探测地址，如 'http://127.0.0.1:8000/'"))
                                     .put("probe_port", field("integer", "可选：本机端口探测，如 8000"))
                                     .put("wait_ms", field("integer", "同步等待启动/完成的毫秒数，默认 4000")))
@@ -346,7 +363,7 @@ public final class BridgeService extends Service {
                             .put(tool("request_alarm", "直接设置手机系统闹钟，并自动读取系统 AlarmManager 核验真实生效的下一响铃时间（闭环验证）", alarmSchema))
                             .put(tool("list_installed_apps", "列出或搜索手机上已安装的应用名称与包名", listAppsSchema))
                             .put(tool("open_app", "按应用中文名（如'微信'、'美团'、'设置'、'时钟'）或包名直接启动应用，等待加载后自动返回新页面快照", openAppSchema))
-                            .put(tool("request_screen_control", "开启或续期 2 分钟屏幕控制会话并立即返回当前屏幕快照（自动激活，无需用户手动点通知）", schema))
+                            .put(tool("request_screen_control", "请求开启或续期临时屏幕控制会话（默认需手机本机人工确认；若在设置中开启自动续期则自动激活）并返回当前屏幕快照", schema))
                             .put(tool("screen_observe", "获取目标屏幕的结构化快照（包含前台应用、窗口 ID、可见文本摘要、带 index 和 view_id 的可交互节点列表）", observeSchema))
                             .put(tool("screen_click_text", "【首选点击工具】按屏幕上的文字、按钮描述(desc)或控件id智能查找并点击，自动等待并返回点击后的最新页面快照与 ui_changed 状态", clickTextSchema))
                             .put(tool("screen_tap", "按 interactive_nodes 的 node_index 序号或 (x,y) 坐标点击/长按屏幕，自动等待并返回点击后的最新页面快照与 ui_changed 状态", tapSchema))
@@ -419,6 +436,7 @@ public final class BridgeService extends Service {
                     } catch (Exception e) { result = textResult("列出应用失败：" + e.getMessage(), true); }
                 } else if ("tools/call".equals(method) && "open_app".equals(req.getJSONObject("params").getString("name"))) {
                     try {
+                        ScreenControlService.authorized();
                         JSONObject a = req.getJSONObject("params").getJSONObject("arguments");
                         String app = a.optString("app", a.optString("query", a.optString("package_name", "")));
                         int waitMs = a.optInt("wait_ms", 1200);
@@ -429,6 +447,7 @@ public final class BridgeService extends Service {
                     } catch (Exception e) { result = classifiedErrorResult("open_app", e); }
                 } else if ("tools/call".equals(method) && "open_app_on_display".equals(req.getJSONObject("params").getString("name"))) {
                     try {
+                        ScreenControlService.authorized();
                         JSONObject a = req.getJSONObject("params").getJSONObject("arguments");
                         String app = a.optString("app", a.optString("package_name", ""));
                         int displayId = a.getInt("display_id");
@@ -444,7 +463,7 @@ public final class BridgeService extends Service {
                         JSONObject out = new JSONObject()
                                 .put("action", "request_screen_control")
                                 .put("active", true)
-                                .put("feedback", "✅ 已自动开启 2 分钟屏幕控制会话并返回当前屏幕快照，请直接根据下方 screen 连续调用动作工具执行任务。")
+                                .put("feedback", "✅ 临时屏幕控制会话已激活（无操作 2 分钟结束，单次上限 10 分钟），已返回当前屏幕快照。")
                                 .put("screen", snap);
                         result = textResult(out.toString(), false);
                     } catch (Exception e) { result = classifiedErrorResult("request_screen_control", e); }
@@ -569,6 +588,7 @@ public final class BridgeService extends Service {
                     catch (Exception e) { result = classifiedErrorResult("shizuku_status", e); }
                 } else if ("tools/call".equals(method) && "virtual_display_create".equals(req.getJSONObject("params").getString("name"))) {
                     try {
+                        ScreenControlService.authorized();
                         JSONObject a = req.getJSONObject("params").optJSONObject("arguments");
                         int w = a != null ? a.optInt("width", 1080) : 1080;
                         int h = a != null ? a.optInt("height", 2400) : 2400;
@@ -578,6 +598,7 @@ public final class BridgeService extends Service {
                     } catch (Exception e) { result = classifiedErrorResult("virtual_display_create", e); }
                 } else if ("tools/call".equals(method) && "virtual_display_destroy".equals(req.getJSONObject("params").getString("name"))) {
                     try {
+                        ScreenControlService.authorized();
                         JSONObject a = req.getJSONObject("params").getJSONObject("arguments");
                         JSONObject resObj = ShizukuBridge.destroyVirtualDisplay(a.getInt("display_id"));
                         result = textResult(resObj.toString(), !resObj.optBoolean("ok", false));
@@ -682,9 +703,10 @@ public final class BridgeService extends Service {
                     } catch (Exception e) { result = textResult("解压/读取压缩包失败：" + e.getMessage(), true); }
                 } else if ("tools/call".equals(method) && "open_file_on_phone".equals(req.getJSONObject("params").getString("name"))) {
                     try {
+                        ScreenControlService.authorized();
                         JSONObject a = req.getJSONObject("params").getJSONObject("arguments");
                         result = textResult(new SystemTools(BridgeService.this).openFileOnPhone(a.getString("path")).toString(), false);
-                    } catch (Exception e) { result = textResult("在手机上打开文件失败：" + e.getMessage(), true); }
+                    } catch (Exception e) { result = classifiedErrorResult("open_file_on_phone", e); }
                 } else {
                     JSONObject error = new JSONObject().put("jsonrpc", "2.0").put("id", req.get("id"))
                             .put("error", new JSONObject().put("code", -32601).put("message", "Method not available"));
@@ -696,13 +718,37 @@ public final class BridgeService extends Service {
         private Response response(Response.Status status, String text) {
             Response r = newFixedLengthResponse(status, "application/json; charset=utf-8", text);
             r.addHeader("Cache-Control", "no-store");
-            addCorsHeaders(r);
+            r.addHeader("X-Content-Type-Options", "nosniff");
             return r;
         }
-        private void addCorsHeaders(Response r) {
-            r.addHeader("Access-Control-Allow-Origin", "*");
-            r.addHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Mcp-Session-Id");
-            r.addHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+        private void addHtmlSecurityHeaders(Response r) {
+            r.addHeader("Cache-Control", "no-store");
+            r.addHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+            r.addHeader("X-Frame-Options", "DENY");
+            r.addHeader("X-Content-Type-Options", "nosniff");
+            r.addHeader("Referrer-Policy", "no-referrer");
+        }
+        private boolean checkContentLength(IHTTPSession session, long maxBytes) {
+            String len = session.getHeaders().get("content-length");
+            if (len == null) return false;
+            try {
+                long n = Long.parseLong(len.trim());
+                return n >= 0 && n <= maxBytes;
+            } catch (NumberFormatException ignored) {
+                return false;
+            }
+        }
+        private boolean isAllowedLocalOrigin(String origin, String baseUrl) {
+            String o = origin.trim();
+            return o.equals(baseUrl)
+                    || o.equals("http://127.0.0.1:8765")
+                    || o.equals("http://localhost:8765");
+        }
+        private Response.IStatus status429() {
+            return new Response.IStatus() {
+                @Override public String getDescription() { return "429 Too Many Requests"; }
+                @Override public int getRequestStatus() { return 429; }
+            };
         }
         private String resolveBaseUrl(IHTTPSession session) {
             Map<String, String> h = session.getHeaders();

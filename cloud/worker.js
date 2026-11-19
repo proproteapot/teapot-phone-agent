@@ -8,6 +8,9 @@ const noStore = {
   'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
 };
 
+const MAX_MCP_BODY_BYTES = 262144; // 256 KiB
+const MAX_OAUTH_BODY_BYTES = 16384;
+
 function sha256Base64Url(input) {
   return createHash('sha256').update(String(input)).digest('base64url');
 }
@@ -17,6 +20,18 @@ function safeEquals(a, b) {
   const da = createHash('sha256').update(a).digest();
   const db = createHash('sha256').update(b).digest();
   return timingSafeEqual(da, db);
+}
+
+function extractBearer(request) {
+  const raw = request.headers.get('Authorization') || '';
+  const m = raw.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1].trim() : '';
+}
+
+function clientIp(request) {
+  return (request.headers.get('CF-Connecting-IP')
+    || request.headers.get('X-Forwarded-For')?.split(',')[0]
+    || 'unknown').trim().slice(0, 64);
 }
 
 function parseHttpsUrl(uri) {
@@ -55,6 +70,7 @@ export class PhoneHub extends DurableObject {
     this.taskQueue = [];
     this.pollWaiters = new Set();
     this.replyWaiters = new Map();
+    this.rateBuckets = new Map();
     this.lastPollAt = 0;
     this.phoneHealth = null;
     this.sql.exec(`
@@ -75,23 +91,51 @@ export class PhoneHub extends DurableObject {
         kind TEXT NOT NULL,
         created_at INTEGER NOT NULL
       );
-      DELETE FROM state WHERE k = 'recent_requests';
+      DELETE FROM state WHERE k IN ('recent_requests', 'tunnel_url');
     `);
   }
 
-  setTunnel(tunnelUrl) {
-    const clean = String(tunnelUrl || '').trim().replace(/\/+$/, '');
-    if (!/^https:\/\/[a-zA-Z0-9.-]+$/.test(clean)) {
-      return { ok: false, error: 'Invalid tunnel_url' };
-    }
+  /** 按桶 + IP 滑动窗口限流（防止匿名爆破与单键自锁 DoS） */
+  checkRateLimit(bucketKey, maxHits, windowMs) {
     const now = Date.now();
-    this.sql.exec(
-      `INSERT INTO state (k, v, updated_at) VALUES ('tunnel_url', ?, ?)
-       ON CONFLICT(k) DO UPDATE SET v = excluded.v, updated_at = excluded.updated_at`,
-      clean,
-      now
-    );
-    return { ok: true, tunnel_url: clean, updated_at: now };
+    if (this.rateBuckets.size > 1000) {
+      for (const [k, rec] of this.rateBuckets.entries()) {
+        if (now - rec.windowStart >= rec.windowMs) this.rateBuckets.delete(k);
+      }
+    }
+    const existing = this.rateBuckets.get(bucketKey);
+    if (!existing || (now - existing.windowStart) >= windowMs) {
+      this.rateBuckets.set(bucketKey, { count: 1, windowStart: now, windowMs });
+      return { limited: false, remaining: maxHits - 1 };
+    }
+    existing.count += 1;
+    return { limited: existing.count > maxHits, remaining: Math.max(0, maxHits - existing.count) };
+  }
+
+  recordAuthFailure(bucketKey, maxFailures, windowMs) {
+    const now = Date.now();
+    const existing = this.rateBuckets.get(bucketKey);
+    if (!existing || (now - existing.windowStart) >= windowMs) {
+      this.rateBuckets.set(bucketKey, { count: 1, windowStart: now, windowMs });
+      return { locked: 1 >= maxFailures };
+    }
+    existing.count += 1;
+    return { locked: existing.count >= maxFailures };
+  }
+
+  isAuthLocked(bucketKey, maxFailures, windowMs) {
+    const now = Date.now();
+    const existing = this.rateBuckets.get(bucketKey);
+    if (!existing) return false;
+    if ((now - existing.windowStart) >= windowMs) {
+      this.rateBuckets.delete(bucketKey);
+      return false;
+    }
+    return existing.count >= maxFailures;
+  }
+
+  clearAuthFailures(bucketKey) {
+    this.rateBuckets.delete(bucketKey);
   }
 
   updatePhoneHealth(health) {
@@ -107,20 +151,13 @@ export class PhoneHub extends DurableObject {
   markOffline() {
     this.lastPollAt = 0;
     this.phoneHealth = null;
-    this.sql.exec(`DELETE FROM state WHERE k = 'tunnel_url'`);
     return { ok: true, offline: true };
   }
 
   getTunnel() {
-    const rows = [...this.sql.exec(`SELECT v, updated_at FROM state WHERE k = 'tunnel_url'`)];
     const now = Date.now();
-    const rawTunnel = rows[0] ? { tunnel_url: rows[0].v, updated_at: rows[0].updated_at } : { tunnel_url: '', updated_at: 0 };
-    // 备用隧道地址超过 10 分钟未刷新视为失效，避免离线时白等死隧道
-    const freshTunnelUrl = (rawTunnel.tunnel_url && (now - rawTunnel.updated_at) < 10 * 60 * 1000) ? rawTunnel.tunnel_url : '';
-    const lastHeartbeat = Math.max(freshTunnelUrl ? rawTunnel.updated_at : 0, this.lastPollAt || 0);
+    const lastHeartbeat = this.lastPollAt || 0;
     return {
-      tunnel_url: freshTunnelUrl,
-      updated_at: freshTunnelUrl ? rawTunnel.updated_at : 0,
       direct_online: (now - this.lastPollAt) < 45000 || this.pollWaiters.size > 0,
       last_poll_at: this.lastPollAt,
       last_heartbeat_ms: lastHeartbeat,
@@ -182,7 +219,6 @@ export class PhoneHub extends DurableObject {
       firstWaiter({ has_task: true, id, body: bodyText });
     } else {
       this.taskQueue.push({ id, body: bodyText });
-      // Do not discard another request silently; its own timeout removes it.
     }
     return replyPromise;
   }
@@ -192,25 +228,31 @@ export class PhoneHub extends DurableObject {
     this.sql.exec(`DELETE FROM auth_codes WHERE expires_at < ?`, now);
     const code = randomBytes(24).toString('base64url');
     this.sql.exec(
-      `INSERT INTO auth_codes (code, redirect_uri, code_challenge, code_challenge_method, expires_at)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO auth_codes (code, redirect_uri, code_challenge, code_challenge_method, expires_at) VALUES (?, ?, ?, ?, ?)`,
       code,
       redirectUri,
-      codeChallenge || '',
-      codeChallenge ? (codeChallengeMethod || 'S256') : '',
+      codeChallenge,
+      codeChallengeMethod,
       now + 5 * 60 * 1000
     );
     return code;
   }
 
+  pruneExpiredTokens() {
+    const now = Date.now();
+    this.sql.exec(`DELETE FROM oauth_tokens WHERE kind = 'access' AND created_at < ?`, now - 30 * 86400000);
+    this.sql.exec(`DELETE FROM oauth_tokens WHERE kind = 'refresh' AND created_at < ?`, now - 90 * 86400000);
+  }
+
   exchangeToken(params) {
-    const grantType = params.grant_type || 'authorization_code';
+    this.pruneExpiredTokens();
+    const grantType = params.grant_type;
     if (grantType === 'refresh_token') {
-      const refresh = params.refresh_token || '';
-      const hash = sha256Base64Url(refresh);
+      const rt = params.refresh_token || '';
+      const hash = sha256Base64Url(rt);
       const rows = [...this.sql.exec(`SELECT token_hash FROM oauth_tokens WHERE token_hash = ? AND kind = 'refresh' AND created_at > ?`, hash, Date.now() - 90 * 86400000)];
       if (!rows.length) return { error: 'invalid_grant', error_description: 'Invalid refresh_token' };
-      this.sql.exec(`DELETE FROM oauth_tokens WHERE token_hash = ? AND kind = 'refresh'`, hash);
+      this.sql.exec(`DELETE FROM oauth_tokens WHERE token_hash = ?`, hash);
       return this.mintTokens();
     }
     if (grantType !== 'authorization_code') return { error: 'unsupported_grant_type' };
@@ -233,20 +275,16 @@ export class PhoneHub extends DurableObject {
   }
 
   mintTokens() {
-    const accessToken = 'pa_' + randomBytes(28).toString('base64url');
-    const refreshToken = 'par_' + randomBytes(28).toString('base64url');
+    this.pruneExpiredTokens();
     const now = Date.now();
-    this.sql.exec(
-      `INSERT OR IGNORE INTO oauth_tokens (token_hash, kind, created_at) VALUES (?, 'access', ?), (?, 'refresh', ?)`,
-      sha256Base64Url(accessToken),
-      now,
-      sha256Base64Url(refreshToken),
-      now
-    );
+    const accessToken = randomBytes(32).toString('base64url');
+    const refreshToken = randomBytes(32).toString('base64url');
+    this.sql.exec(`INSERT INTO oauth_tokens (token_hash, kind, created_at) VALUES (?, 'access', ?)`, sha256Base64Url(accessToken), now);
+    this.sql.exec(`INSERT INTO oauth_tokens (token_hash, kind, created_at) VALUES (?, 'refresh', ?)`, sha256Base64Url(refreshToken), now);
     return {
       access_token: accessToken,
       token_type: 'Bearer',
-      expires_in: 86400 * 30,
+      expires_in: 30 * 24 * 3600,
       refresh_token: refreshToken,
       scope: 'mcp',
     };
@@ -265,29 +303,18 @@ export class PhoneHub extends DurableObject {
     return { ok: true };
   }
 
-  checkAndRecordAuthAttempt(success) {
-    const now = Date.now();
+  /** 按源 IP 分桶的授权页防爆破（防止匿名路人单键锁死机主） */
+  checkAndRecordAuthAttempt(success, ip = 'unknown') {
+    const key = `auth_fail:${ip}`;
     const windowMs = 15 * 60 * 1000;
-    const rows = [...this.sql.exec(`SELECT v, updated_at FROM state WHERE k = 'failed_auth_count'`)];
-    let count = 0;
-    if (rows[0] && (now - rows[0].updated_at) < windowMs) {
-      count = Number(rows[0].v) || 0;
-    }
-    if (count >= 5) {
+    if (this.isAuthLocked(key, 5, windowMs)) {
       return { locked: true };
     }
     if (success) {
-      this.sql.exec(`DELETE FROM state WHERE k = 'failed_auth_count'`);
+      this.clearAuthFailures(key);
       return { locked: false };
     }
-    count += 1;
-    this.sql.exec(
-      `INSERT INTO state (k, v, updated_at) VALUES ('failed_auth_count', ?, ?)
-       ON CONFLICT(k) DO UPDATE SET v = excluded.v, updated_at = excluded.updated_at`,
-      String(count),
-      now
-    );
-    return { locked: count >= 5 };
+    return this.recordAuthFailure(key, 5, windowMs);
   }
 }
 
@@ -306,68 +333,76 @@ const AUTH_SERVER_META_PATHS = new Set([
   '/mcp/.well-known/openid-configuration',
 ]);
 
+async function readTextLimited(request, maxBytes) {
+  const cl = Number(request.headers.get('content-length') || 0);
+  if (cl > maxBytes) return { tooLarge: true, text: '' };
+  const text = await request.text();
+  if (new TextEncoder().encode(text).byteLength > maxBytes) {
+    return { tooLarge: true, text: '' };
+  }
+  return { tooLarge: false, text };
+}
+
 async function handleRequest(request, env, url, hub) {
   if (request.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: noStore });
   }
   const baseUrl = `${url.protocol}//${url.host}`;
   const secret = env.PHONE_SECRET || '';
+  const ip = clientIp(request);
+  const bearer = extractBearer(request);
 
-  // 1. Phone registration & Direct Java Reverse-RPC endpoints
-  if (url.pathname === '/_phone/register' && request.method === 'POST') {
-    const auth = (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '').trim();
-    if (!secret || !safeEquals(auth, secret)) {
+  // 1. Direct Java Reverse-RPC Phone Control Endpoints (Header Bearer + IP failure lockout)
+  if (url.pathname.startsWith('/_phone/') && request.method === 'POST') {
+    const lockKey = `phone_fail:${ip}`;
+    if (await hub.isAuthLocked(lockKey, 15, 15 * 60 * 1000)) {
+      return Response.json({ error: 'Too Many Requests' }, { status: 429, headers: noStore });
+    }
+    if (!secret || !safeEquals(bearer, secret)) {
+      await hub.recordAuthFailure(lockKey, 15, 15 * 60 * 1000);
       return Response.json({ error: 'Unauthorized' }, { status: 401, headers: noStore });
     }
-    const body = await request.json().catch(() => ({}));
-    const res = await hub.setTunnel(body.tunnel_url);
-    return Response.json(res, { status: res.ok ? 200 : 400, headers: noStore });
-  }
+    await hub.clearAuthFailures(lockKey);
 
-  if (url.pathname === '/_phone/poll' && request.method === 'POST') {
-    const auth = (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '').trim();
-    if (!secret || !safeEquals(auth, secret)) {
-      return Response.json({ error: 'Unauthorized' }, { status: 401, headers: noStore });
+    const bodyCheck = await readTextLimited(request, MAX_MCP_BODY_BYTES);
+    if (bodyCheck.tooLarge) return Response.json({ error: 'Payload Too Large' }, { status: 413, headers: noStore });
+    let payload = {};
+    try { payload = bodyCheck.text ? JSON.parse(bodyCheck.text) : {}; } catch {}
+
+    if (url.pathname === '/_phone/poll') {
+      const task = await hub.pollTask(20000, payload && payload.health ? payload.health : null);
+      return Response.json(task, { headers: noStore });
     }
-    const payload = await request.json().catch(() => ({}));
-    const task = await hub.pollTask(20000, payload && payload.health ? payload.health : null);
-    return Response.json(task, { headers: noStore });
-  }
-
-  if (url.pathname === '/_phone/reply' && request.method === 'POST') {
-    const auth = (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '').trim();
-    if (!secret || !safeEquals(auth, secret)) {
-      return Response.json({ error: 'Unauthorized' }, { status: 401, headers: noStore });
+    if (url.pathname === '/_phone/reply') {
+      const res = await hub.submitReply(payload.id, payload.status, payload.body);
+      return Response.json(res, { headers: noStore });
     }
-    const payload = await request.json().catch(() => ({}));
-    const res = await hub.submitReply(payload.id, payload.status, payload.body);
-    return Response.json(res, { headers: noStore });
+    if (url.pathname === '/_phone/revoke') {
+      return Response.json(await hub.revokeOAuthTokens(), { headers: noStore });
+    }
+    if (url.pathname === '/_phone/offline') {
+      return Response.json(await hub.markOffline(), { headers: noStore });
+    }
+    return Response.json({ error: 'Not Found' }, { status: 404, headers: noStore });
   }
 
-  if (url.pathname === '/_phone/revoke' && request.method === 'POST') {
-    const auth = (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '').trim();
-    if (!secret || !safeEquals(auth, secret)) return Response.json({ error: 'Unauthorized' }, { status: 401, headers: noStore });
-    return Response.json(await hub.revokeOAuthTokens(), { headers: noStore });
-  }
-
-  if (url.pathname === '/_phone/offline' && request.method === 'POST') {
-    const auth = (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '').trim();
-    if (!secret || !safeEquals(auth, secret)) return Response.json({ error: 'Unauthorized' }, { status: 401, headers: noStore });
-    return Response.json(await hub.markOffline(), { headers: noStore });
-  }
-
+  // 匿名 /health 仅返回最小存活状态，携带合法 Bearer 鉴权后返回完整设备诊断
   if (url.pathname === '/health' && request.method === 'GET') {
+    const isDirectSecret = Boolean(secret && bearer && safeEquals(bearer, secret));
+    const isOAuth = !isDirectSecret && Boolean(bearer && (await hub.verifyAccessToken(bearer)));
+    if (!isDirectSecret && !isOAuth) {
+      return Response.json({ ok: true, service: 'teapot-phone-agent' }, { headers: noStore });
+    }
     const info = await hub.getTunnel();
     return Response.json({
       ok: true,
       service: 'teapot-phone-agent',
       phone_online: Boolean(info.direct_online),
-      tunnel_connected: Boolean(info.direct_online || info.tunnel_url),
       direct_online: Boolean(info.direct_online),
       poll_waiters: info.poll_waiters,
       last_heartbeat_ms: info.last_heartbeat_ms || 0,
       heartbeat_age_ms: info.heartbeat_age_ms ?? null,
-      updated_at: Math.max(info.updated_at || 0, info.last_poll_at || 0),
+      updated_at: info.last_poll_at || 0,
       phone: info.phone_health || null,
     }, { headers: noStore });
   }
@@ -397,7 +432,12 @@ async function handleRequest(request, env, url, hub) {
   }
 
   if (request.method === 'POST' && (url.pathname === '/oauth/register' || url.pathname === '/mcp/oauth/register' || url.pathname === '/register')) {
-    const body = await request.json().catch(() => ({}));
+    const rl = await hub.checkRateLimit(`reg:${ip}`, 30, 60 * 1000);
+    if (rl.limited) return Response.json({ error: 'too_many_requests' }, { status: 429, headers: noStore });
+    const bodyCheck = await readTextLimited(request, MAX_OAUTH_BODY_BYTES);
+    if (bodyCheck.tooLarge) return Response.json({ error: 'payload_too_large' }, { status: 413, headers: noStore });
+    let body = {};
+    try { body = bodyCheck.text ? JSON.parse(bodyCheck.text) : {}; } catch {}
     const authMethod = body.token_endpoint_auth_method || 'client_secret_post';
     const resBody = {
       client_id: 'pa_client_' + randomBytes(8).toString('base64url'),
@@ -441,6 +481,8 @@ async function handleRequest(request, env, url, hub) {
           ...noStore,
           'Content-Type': 'text/html; charset=utf-8',
           'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; form-action ${formActions}; frame-ancestors 'none'; base-uri 'none'`,
+          'X-Frame-Options': 'DENY',
+          'X-Content-Type-Options': 'nosniff',
           'Referrer-Policy': 'same-origin',
         },
       });
@@ -452,47 +494,53 @@ async function handleRequest(request, env, url, hub) {
       const form = await request.formData().catch(() => null);
       const supplied = String(form?.get('code') || '').trim();
       const ok = Boolean(secret && safeEquals(supplied, secret));
-      const attempt = await hub.checkAndRecordAuthAttempt(ok);
+      const attempt = await hub.checkAndRecordAuthAttempt(ok, ip);
       if (attempt.locked) {
-        return new Response('<!doctype html><meta charset="utf-8"><h3>尝试次数过多，已临时锁定 15 分钟。</h3>', {
+        return new Response('<!doctype html><meta charset="utf-8"><h3>尝试次数过多，当前 IP 已临时锁定 15 分钟。</h3>', {
           status: 429,
           headers: { ...noStore, 'Content-Type': 'text/html; charset=utf-8' },
         });
       }
       if (!ok) {
-        return new Response('<!doctype html><meta charset="utf-8"><h3>连接码无效，请返回重试。</h3>', {
+        return new Response('<!doctype html><meta charset="utf-8"><h3>连接码错误，请返回重试。</h3>', {
           status: 403,
           headers: { ...noStore, 'Content-Type': 'text/html; charset=utf-8' },
         });
       }
       const authCode = await hub.createAuthCode(redirectUri, codeChallenge, codeChallengeMethod);
-      const redirectTo = new URL(redirectUri);
-      redirectTo.searchParams.set('code', authCode);
-      if (state) redirectTo.searchParams.set('state', state);
-      return new Response(null, { status: 303, headers: { ...noStore, Location: redirectTo.toString() } });
+      const target = new URL(redirectUri);
+      target.searchParams.set('code', authCode);
+      if (state) target.searchParams.set('state', state);
+      return new Response(null, { status: 302, headers: { ...noStore, Location: target.toString() } });
     }
   }
 
   if (request.method === 'POST' && url.pathname === '/oauth/token') {
+    const rl = await hub.checkRateLimit(`token:${ip}`, 30, 60 * 1000);
+    if (rl.limited) return Response.json({ error: 'too_many_requests' }, { status: 429, headers: noStore });
+    const bodyCheck = await readTextLimited(request, MAX_OAUTH_BODY_BYTES);
+    if (bodyCheck.tooLarge) return Response.json({ error: 'payload_too_large' }, { status: 413, headers: noStore });
     const ct = request.headers.get('content-type') || '';
     let params = {};
     if (ct.includes('application/json')) {
-      params = await request.json().catch(() => ({}));
+      try { params = JSON.parse(bodyCheck.text || '{}'); } catch {}
     } else {
-      const text = await request.text();
-      params = Object.fromEntries(new URLSearchParams(text));
+      params = Object.fromEntries(new URLSearchParams(bodyCheck.text));
     }
     const res = await hub.exchangeToken(params);
     return Response.json(res, { status: res.error ? 400 : 200, headers: noStore });
   }
 
-  // 3. MCP Endpoint (/mcp — Header Bearer auth only)
+  // 3. MCP Endpoint (/mcp — Header Bearer auth only + IP failure lockout + body size cap)
   if (url.pathname === '/mcp') {
-    const authHeader = request.headers.get('Authorization') || '';
-    const presented = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    const isDirectSecret = secret && safeEquals(presented, secret);
-    const isOAuthToken = !isDirectSecret && presented && (await hub.verifyAccessToken(presented));
+    const lockKey = `mcp_fail:${ip}`;
+    if (await hub.isAuthLocked(lockKey, 15, 15 * 60 * 1000)) {
+      return Response.json({ error: 'Too Many Requests' }, { status: 429, headers: noStore });
+    }
+    const isDirectSecret = Boolean(secret && bearer && safeEquals(bearer, secret));
+    const isOAuthToken = !isDirectSecret && Boolean(bearer && (await hub.verifyAccessToken(bearer)));
     if (!isDirectSecret && !isOAuthToken) {
+      await hub.recordAuthFailure(lockKey, 15, 15 * 60 * 1000);
       return new Response('{}', {
         status: 401,
         headers: {
@@ -502,10 +550,19 @@ async function handleRequest(request, env, url, hub) {
         },
       });
     }
+    await hub.clearAuthFailures(lockKey);
     if (request.method === 'DELETE') return Response.json({}, { headers: noStore });
     if (request.method !== 'POST') return new Response('{}', { status: 405, headers: noStore });
 
-    const bodyText = await request.text();
+    const bodyCheck = await readTextLimited(request, MAX_MCP_BODY_BYTES);
+    if (bodyCheck.tooLarge) {
+      return Response.json({
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32600, message: '请求体过大（上限 256 KiB）', data: { error_code: 'action_failed', stage: 'cloud_validation', retryable: false } },
+      }, { status: 413, headers: noStore });
+    }
+    const bodyText = bodyCheck.text;
     let reqId = null;
     try {
       const parsed = JSON.parse(bodyText);
@@ -522,72 +579,28 @@ async function handleRequest(request, env, url, hub) {
     }, { status, headers: noStore });
 
     const info = await hub.getTunnel();
-    if (!info.direct_online && !info.tunnel_url) {
+    if (!info.direct_online) {
       return mcpError(503, -32000, '手机当前未在线，请确认手机助手桥正在运行。', 'phone_offline', 'cloud_dispatch', true, {
         last_heartbeat_ms: info.last_heartbeat_ms || 0,
         heartbeat_age_ms: info.heartbeat_age_ms ?? null,
       });
     }
 
-    // Priority 1: Always attempt Direct Java Reverse-RPC channel first when online or queueable.
-    // 若当前无活跃 poll_waiters（可能处于轮询交接窗口或刚异常断网），使用 3.5 秒短超时快速判死。
-    if (info.direct_online) {
-      const dispatchTimeoutMs = info.poll_waiters > 0 ? 15000 : 3500;
-      const directRes = await hub.dispatchMcpToPhone(bodyText, dispatchTimeoutMs);
-      if (directRes && directRes.ok) {
-        return new Response(directRes.body || '{}', {
-          status: directRes.status || 200,
-          headers: {
-            ...noStore,
-            'Content-Type': 'application/json; charset=utf-8',
-          },
-        });
-      }
-
-      if (directRes.error === 'outcome_unknown') {
-        return mcpError(504, -32001, '手机可能已执行请求但结果超时；请先检查结果，不要盲目重试。', 'request_timeout', 'phone_execution', false);
-      }
-
-      if (directRes.error !== 'not_delivered') {
-        return mcpError(503, -32000, '手机请求队列已满或连接异常，请确认手机助手桥状态。', 'phone_offline', 'cloud_queue', true);
-      }
+    const dispatchTimeoutMs = info.poll_waiters > 0 ? 15000 : 3500;
+    const directRes = await hub.dispatchMcpToPhone(bodyText, dispatchTimeoutMs);
+    if (directRes && directRes.ok) {
+      return new Response(directRes.body || '{}', {
+        status: directRes.status || 200,
+        headers: {
+          ...noStore,
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+      });
     }
-
-    // A request already delivered to the phone may still finish after timeout.
-    // Only retry if it was definitely removed before any poller could receive it.
-    if (info.tunnel_url) {
-      try {
-        const upstream = await fetch(`${info.tunnel_url}/mcp`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json; charset=utf-8',
-            'Authorization': `Bearer ${secret}`,
-          },
-          body: bodyText,
-          signal: AbortSignal.timeout(8000),
-        });
-        const respText = await upstream.text();
-        return new Response(respText, {
-          status: upstream.status,
-          headers: {
-            ...noStore,
-            'Content-Type': upstream.headers.get('Content-Type') || 'application/json; charset=utf-8',
-          },
-        });
-      } catch (err) {
-        const isTimeout = err && (err.name === 'TimeoutError' || err.name === 'AbortError');
-        return mcpError(
-          isTimeout ? 504 : 503,
-          isTimeout ? -32001 : -32000,
-          isTimeout ? '连接手机隧道超时，请检查手机网络或服务状态。' : '无法连接到手机隧道，手机可能已离线。',
-          isTimeout ? 'request_timeout' : 'phone_offline',
-          'cloud_to_tunnel',
-          true
-        );
-      }
+    if (directRes.error === 'outcome_unknown') {
+      return mcpError(504, -32001, '手机可能已执行请求但结果超时；请先检查结果，不要盲目重试。', 'request_timeout', 'phone_execution', false);
     }
-
-    return mcpError(503, -32000, '手机当前未在线，请确认手机助手桥正在运行。', 'phone_offline', 'cloud_dispatch', true);
+    return mcpError(503, -32000, '手机当前未在线或请求未送达，请确认手机助手桥状态。', 'phone_offline', 'cloud_dispatch', true);
   }
 
   return new Response('Not Found', { status: 404, headers: noStore });

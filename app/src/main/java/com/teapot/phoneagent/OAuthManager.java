@@ -51,6 +51,11 @@ final class OAuthManager {
 
     private static final Map<String, AuthCodeRecord> PENDING_CODES = new ConcurrentHashMap<>();
     private static final Map<String, Long> CSRF_NONCES = new ConcurrentHashMap<>();
+    private static final int MAX_PENDING_MAP_SIZE = 200;
+    private static final int MAX_LOCAL_AUTH_FAILURES = 5;
+    private static final long LOCAL_AUTH_LOCK_MS = 15 * 60 * 1000L;
+    private static int localAuthFailures = 0;
+    private static long localAuthLockedUntil = 0L;
 
     OAuthManager(Context context) {
         this.context = context.getApplicationContext();
@@ -63,6 +68,7 @@ final class OAuthManager {
         if (existingEnc != null) {
             String decrypted = decryptWithKeystore(existingEnc);
             if (decrypted != null && !decrypted.isEmpty()) return decrypted;
+            throw new IllegalStateException("AndroidKeyStore 解密本机连接码失败，请在应用中点击「重置连接码并吊销全部授权」重新生成");
         }
         // 仅迁移旧版明文 token 至 AndroidKeyStore 加密存储，迁移后立即清除旧明文项
         SharedPreferences legacy = context.getSharedPreferences(BridgeService.PREFS, Context.MODE_PRIVATE);
@@ -72,12 +78,13 @@ final class OAuthManager {
             random.nextBytes(bytes);
             token = Base64.encodeToString(bytes, Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING);
         } else {
-            legacy.edit().remove(BridgeService.TOKEN).apply();
+            legacy.edit().remove(BridgeService.TOKEN).commit();
         }
         String encrypted = encryptWithKeystore(token);
-        if (encrypted != null) {
-            prefs.edit().putString(KEY_ENC_PAIRING, encrypted).apply();
+        if (encrypted == null) {
+            throw new IllegalStateException("AndroidKeyStore 加密存储本机连接码失败");
         }
+        prefs.edit().putString(KEY_ENC_PAIRING, encrypted).commit();
         return token;
     }
 
@@ -89,13 +96,47 @@ final class OAuthManager {
         context.getSharedPreferences(BridgeService.PREFS, Context.MODE_PRIVATE)
                 .edit().remove(BridgeService.TOKEN).commit();
         String encrypted = encryptWithKeystore(token);
-        SharedPreferences.Editor editor = prefs.edit()
+        if (encrypted == null) {
+            throw new IllegalStateException("AndroidKeyStore 加密存储本机连接码失败");
+        }
+        prefs.edit()
                 .remove(KEY_TOKEN_HASHES)
-                .remove(KEY_REFRESH_HASHES);
-        if (encrypted != null) editor.putString(KEY_ENC_PAIRING, encrypted);
-        editor.commit();
+                .remove(KEY_REFRESH_HASHES)
+                .putString(KEY_ENC_PAIRING, encrypted)
+                .commit();
         PENDING_CODES.clear();
+        CSRF_NONCES.clear();
+        synchronized (OAuthManager.class) {
+            localAuthFailures = 0;
+            localAuthLockedUntil = 0L;
+        }
         return token;
+    }
+
+    static boolean isLocalAuthLocked() {
+        synchronized (OAuthManager.class) {
+            long now = System.currentTimeMillis();
+            if (localAuthLockedUntil > now) return true;
+            if (localAuthLockedUntil != 0L && localAuthLockedUntil <= now) {
+                localAuthLockedUntil = 0L;
+                localAuthFailures = 0;
+            }
+            return false;
+        }
+    }
+
+    static void recordLocalAuthAttempt(boolean ok) {
+        synchronized (OAuthManager.class) {
+            if (ok) {
+                localAuthFailures = 0;
+                localAuthLockedUntil = 0L;
+                return;
+            }
+            localAuthFailures++;
+            if (localAuthFailures >= MAX_LOCAL_AUTH_FAILURES) {
+                localAuthLockedUntil = System.currentTimeMillis() + LOCAL_AUTH_LOCK_MS;
+            }
+        }
     }
 
     synchronized int getActiveOAuthTokenCount() {
@@ -112,8 +153,9 @@ final class OAuthManager {
 
     /** 校验 Authorization: Bearer <token> 头（支持本机配对令牌或已签发的 OAuth access_token）。 */
     boolean verifyBearerHeader(String authHeader) {
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) return false;
-        String presented = authHeader.substring("Bearer ".length()).trim();
+        if (authHeader == null || authHeader.length() < 8) return false;
+        if (!authHeader.regionMatches(true, 0, "Bearer ", 0, 7)) return false;
+        String presented = authHeader.substring(7).trim();
         if (presented.isEmpty()) return false;
         String pairing = getOrCreatePairingToken();
         if (MessageDigest.isEqual(
@@ -128,22 +170,43 @@ final class OAuthManager {
         }
     }
 
+    private static Set<String> pruneExpired(Set<String> entries, long now) {
+        Set<String> clean = new HashSet<>();
+        if (entries == null) return clean;
+        for (String entry : entries) {
+            int separator = entry.lastIndexOf(':');
+            if (separator <= 0) continue;
+            try {
+                if (Long.parseLong(entry.substring(separator + 1)) > now) {
+                    clean.add(entry);
+                }
+            } catch (NumberFormatException ignored) { }
+        }
+        return clean;
+    }
+
     private static boolean validToken(Set<String> entries, String hash) {
         if (entries == null) return false;
+        long now = System.currentTimeMillis();
         for (String entry : entries) {
             int separator = entry.lastIndexOf(':');
             if (separator <= 0 || !entry.substring(0, separator).equals(hash)) continue;
-            try { return Long.parseLong(entry.substring(separator + 1)) > System.currentTimeMillis(); }
+            try { return Long.parseLong(entry.substring(separator + 1)) > now; }
             catch (NumberFormatException ignored) { return false; }
         }
         return false;
     }
 
     String createCsrfNonce() {
+        long now = System.currentTimeMillis();
+        CSRF_NONCES.entrySet().removeIf(e -> e.getValue() == null || e.getValue() <= now);
+        if (CSRF_NONCES.size() >= MAX_PENDING_MAP_SIZE) {
+            CSRF_NONCES.clear();
+        }
         byte[] b = new byte[16];
         random.nextBytes(b);
         String nonce = Base64.encodeToString(b, Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING);
-        CSRF_NONCES.put(nonce, System.currentTimeMillis() + 10 * 60 * 1000L);
+        CSRF_NONCES.put(nonce, now + 10 * 60 * 1000L);
         return nonce;
     }
 
@@ -153,55 +216,51 @@ final class OAuthManager {
         return exp != null && System.currentTimeMillis() <= exp;
     }
 
-    /** 校验 OAuth 回调地址是否属于受信任的远程 MCP 客户端 HTTPS 域名。 */
+    /** 校验 OAuth 回调地址是否属于受信任的远程 MCP 客户端精确白名单。 */
     static boolean isAllowedCallback(String redirectUri) {
         if (redirectUri == null || redirectUri.isEmpty() || redirectUri.contains("\\")) return false;
-        if ("https://chatgpt.com/connector_platform_oauth_redirect".equals(redirectUri)
-                || redirectUri.matches("https://chatgpt\\.com/connector/oauth/[\\w-]+")) {
-            return true;
-        }
-        try {
-            java.net.URI parsed = java.net.URI.create(redirectUri);
-            if (!"https".equalsIgnoreCase(parsed.getScheme())) return false;
-            if (parsed.getRawUserInfo() != null || parsed.getPort() != -1) return false;
-            String rawHost = parsed.getHost();
-            if (rawHost == null || rawHost.isEmpty()) return false;
-            String host = rawHost.toLowerCase(java.util.Locale.ROOT);
-            return host.equals("chatgpt.com")
-                    || host.endsWith(".chatgpt.com")
-                    || host.equals("openai.com")
-                    || host.endsWith(".openai.com")
-                    || host.equals("claude.ai")
-                    || host.endsWith(".claude.ai");
-        } catch (Exception ignored) {
-            return false;
-        }
+        return "https://chatgpt.com/connector_platform_oauth_redirect".equals(redirectUri)
+                || redirectUri.matches("https://chatgpt\\.com/connector/oauth/[A-Za-z0-9_-]{1,128}")
+                || "https://chat.openai.com/aip/plugin-oauth/callback".equals(redirectUri)
+                || "https://claude.ai/api/mcp/auth_callback".equals(redirectUri);
+    }
+
+    static boolean isValidS256Challenge(String codeChallenge, String codeChallengeMethod) {
+        return "S256".equals(codeChallengeMethod)
+                && codeChallenge != null
+                && codeChallenge.matches("[A-Za-z0-9_-]{43}");
     }
 
     String issueAuthCode(String redirectUri, String codeChallenge, String codeChallengeMethod) {
         if (!isAllowedCallback(redirectUri))
             throw new SecurityException("invalid redirect_uri");
-        if (codeChallenge == null || !codeChallenge.matches("[A-Za-z0-9_-]{43}") || !"S256".equals(codeChallengeMethod))
+        if (!isValidS256Challenge(codeChallenge, codeChallengeMethod))
             throw new SecurityException("S256 PKCE required");
+        long now = System.currentTimeMillis();
+        PENDING_CODES.entrySet().removeIf(e -> e.getValue() == null || e.getValue().expiresAt <= now);
+        if (PENDING_CODES.size() >= MAX_PENDING_MAP_SIZE) {
+            throw new SecurityException("too many pending authorization codes");
+        }
         byte[] b = new byte[24];
         random.nextBytes(b);
         String code = Base64.encodeToString(b, Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING);
         PENDING_CODES.put(code, new AuthCodeRecord(
                 redirectUri,
-                codeChallenge == null ? "" : codeChallenge,
-                (codeChallengeMethod == null || codeChallengeMethod.isEmpty()) ? "S256" : codeChallengeMethod,
-                System.currentTimeMillis() + 5 * 60 * 1000L
+                codeChallenge,
+                "S256",
+                now + 5 * 60 * 1000L
         ));
         return code;
     }
 
     JSONObject exchangeToken(Map<String, String> params) throws Exception {
       synchronized (OAuthManager.class) {
+        long now = System.currentTimeMillis();
         String grantType = params.get("grant_type");
         if ("refresh_token".equals(grantType)) {
             String refresh = params.get("refresh_token");
             if (refresh == null || refresh.isEmpty()) throw new IllegalArgumentException("missing refresh_token");
-            Set<String> refreshSet = new HashSet<>(prefs.getStringSet(KEY_REFRESH_HASHES, new HashSet<String>()));
+            Set<String> refreshSet = pruneExpired(prefs.getStringSet(KEY_REFRESH_HASHES, null), now);
             String refreshHash = sha256Base64Url(refresh);
             if (!validToken(refreshSet, refreshHash)) {
                 throw new SecurityException("invalid refresh_token");
@@ -214,22 +273,22 @@ final class OAuthManager {
         String code = params.get("code");
         if (code == null || code.isEmpty()) throw new IllegalArgumentException("missing code");
         AuthCodeRecord record = PENDING_CODES.remove(code);
-        if (record == null || System.currentTimeMillis() > record.expiresAt) {
+        if (record == null || now > record.expiresAt) {
             throw new SecurityException("expired or invalid code");
         }
-        if (!record.redirectUri.equals(params.get("redirect_uri")) || record.codeChallenge.isEmpty() || !"S256".equals(record.codeChallengeMethod)) throw new SecurityException("invalid redirect or PKCE");
-        if (!record.codeChallenge.isEmpty()) {
-            String verifier = params.get("code_verifier");
-            if (verifier == null) verifier = "";
-            if (!verifier.matches("[A-Za-z0-9._~-]{43,128}")) throw new SecurityException("invalid PKCE verifier");
-            String computed = "plain".equalsIgnoreCase(record.codeChallengeMethod)
-                    ? verifier
-                    : sha256Base64Url(verifier);
-            if (!MessageDigest.isEqual(
-                    record.codeChallenge.getBytes(StandardCharsets.UTF_8),
-                    computed.getBytes(StandardCharsets.UTF_8))) {
-                throw new SecurityException("PKCE verification failed");
-            }
+        if (!record.redirectUri.equals(params.get("redirect_uri"))
+                || !isValidS256Challenge(record.codeChallenge, record.codeChallengeMethod)) {
+            throw new SecurityException("invalid redirect or PKCE");
+        }
+        String verifier = params.get("code_verifier");
+        if (verifier == null || !verifier.matches("[A-Za-z0-9._~-]{43,128}")) {
+            throw new SecurityException("invalid PKCE verifier");
+        }
+        String computed = sha256Base64Url(verifier);
+        if (!MessageDigest.isEqual(
+                record.codeChallenge.getBytes(StandardCharsets.UTF_8),
+                computed.getBytes(StandardCharsets.UTF_8))) {
+            throw new SecurityException("PKCE verification failed");
         }
         return mintTokenResponse();
       }
@@ -242,9 +301,9 @@ final class OAuthManager {
         random.nextBytes(rb);
         String accessToken = "pa_" + Base64.encodeToString(ab, Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING);
         String refreshToken = "par_" + Base64.encodeToString(rb, Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING);
-        Set<String> tokenSet = new HashSet<>(prefs.getStringSet(KEY_TOKEN_HASHES, new HashSet<String>()));
-        Set<String> refreshSet = new HashSet<>(prefs.getStringSet(KEY_REFRESH_HASHES, new HashSet<String>()));
         long now = System.currentTimeMillis();
+        Set<String> tokenSet = pruneExpired(prefs.getStringSet(KEY_TOKEN_HASHES, null), now);
+        Set<String> refreshSet = pruneExpired(prefs.getStringSet(KEY_REFRESH_HASHES, null), now);
         tokenSet.add(sha256Base64Url(accessToken) + ":" + (now + 30L * 86400000L));
         refreshSet.add(sha256Base64Url(refreshToken) + ":" + (now + 90L * 86400000L));
         prefs.edit()
@@ -294,24 +353,45 @@ final class OAuthManager {
                 .put("token_endpoint_auth_method", "none");
     }
 
+    static String escapeHtml(String s) {
+        if (s == null) return "";
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '&': sb.append("&amp;"); break;
+                case '<': sb.append("&lt;"); break;
+                case '>': sb.append("&gt;"); break;
+                case '"': sb.append("&quot;"); break;
+                case '\'': sb.append("&#39;"); break;
+                default: sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
     String renderAuthorizeHtml(Map<String, String> queryParams) {
         String csrf = createCsrfNonce();
-        Uri.Builder action = new Uri.Builder().path("/oauth/authorize");
-        for (Map.Entry<String, String> e : queryParams.entrySet()) {
-            if (e.getKey() != null && e.getValue() != null) action.appendQueryParameter(e.getKey(), e.getValue());
-        }
+        String redirectUri = queryParams.get("redirect_uri");
+        String state = queryParams.get("state");
+        String codeChallenge = queryParams.get("code_challenge");
+        String codeChallengeMethod = queryParams.get("code_challenge_method");
         return "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
                 + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                + "<title>手机助手桥 · OAuth 授权</title>"
+                + "<title>Teapot Phone-Agent · OAuth 授权</title>"
                 + "<style>body{font-family:system-ui,sans-serif;max-width:420px;margin:32px auto;padding:20px;line-height:1.5;background:#f8f9fa;color:#1f1f1f}"
                 + ".card{background:#fff;padding:24px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,.08)}"
                 + "input,button{width:100%;padding:12px;margin-top:12px;font-size:16px;box-sizing:border-box;border-radius:8px}"
                 + "input{border:1px solid #ccc}button{background:#0b57d0;color:#fff;border:0;font-weight:600}</style></head>"
                 + "<body><div class='card'><h2>允许远程 MCP 客户端连接 Teapot Phone-Agent？</h2>"
-                + "<p>请打开手机上的<b>手机助手桥</b>应用，点击「复制本机服务令牌」，粘贴到下方以完成安全配对：</p>"
-                + "<form method='POST' action='" + action.build().toString() + "'>"
-                + "<input type='hidden' name='csrf' value='" + csrf + "'/>"
-                + "<input type='password' name='secret' placeholder='在此粘贴手机助手桥令牌' required autofocus/>"
+                + "<p>请打开手机上的<b>Teapot Phone-Agent</b>应用，点击「复制连接码」，粘贴到下方以完成安全配对：</p>"
+                + "<form method='POST' action='/oauth/authorize'>"
+                + "<input type='hidden' name='csrf' value='" + escapeHtml(csrf) + "'/>"
+                + "<input type='hidden' name='redirect_uri' value='" + escapeHtml(redirectUri) + "'/>"
+                + "<input type='hidden' name='state' value='" + escapeHtml(state) + "'/>"
+                + "<input type='hidden' name='code_challenge' value='" + escapeHtml(codeChallenge) + "'/>"
+                + "<input type='hidden' name='code_challenge_method' value='" + escapeHtml(codeChallengeMethod) + "'/>"
+                + "<input type='password' name='secret' placeholder='在此粘贴本机连接码' required autofocus/>"
                 + "<button type='submit'>批准并连接手机</button></form></div></body></html>";
     }
 

@@ -27,6 +27,9 @@ public final class LocalFileProvider extends ContentProvider {
             throw new SecurityException("文件不在共享存储目录内");
         }
         String rel = targetPath.substring(rootPath.length() + 1).replace(File.separatorChar, '/');
+        if ("android".equalsIgnoreCase(rel) || rel.toLowerCase(java.util.Locale.ROOT).startsWith("android/")) {
+            throw new SecurityException("安全限制：禁止共享系统 Android 目录下的文件");
+        }
         Uri.Builder b = new Uri.Builder().scheme("content").authority(AUTHORITY);
         for (String seg : rel.split("/")) {
             if (!seg.isEmpty()) b.appendPath(seg);
@@ -40,8 +43,14 @@ public final class LocalFileProvider extends ContentProvider {
             String path = uri.getPath();
             if (path == null || path.isEmpty()) throw new FileNotFoundException("路径为空");
             File target = new File(root, path).getCanonicalFile();
-            if (!target.getPath().startsWith(root.getPath() + File.separator) || !target.isFile()) {
+            String rootPath = root.getPath();
+            String targetPath = target.getPath();
+            if (!targetPath.startsWith(rootPath + File.separator) || !target.isFile()) {
                 throw new FileNotFoundException("文件不存在或越界");
+            }
+            String rel = targetPath.substring(rootPath.length() + 1).replace(File.separatorChar, '/');
+            if ("android".equalsIgnoreCase(rel) || rel.toLowerCase(java.util.Locale.ROOT).startsWith("android/")) {
+                throw new FileNotFoundException("安全限制：禁止读取系统 Android 目录");
             }
             return target;
         } catch (FileNotFoundException e) {

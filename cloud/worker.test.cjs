@@ -4,7 +4,6 @@ const fs = require('node:fs');
 const { DatabaseSync } = require('node:sqlite');
 const { createHash, randomBytes, timingSafeEqual } = require('node:crypto');
 
-// Load the real Worker with only the Cloudflare runtime base class substituted.
 const source = fs.readFileSync(require('node:path').join(__dirname, 'worker.js'), 'utf8')
   .replace("import { DurableObject } from 'cloudflare:workers';", '')
   .replace("import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';", '')
@@ -34,7 +33,13 @@ test('delivered timeout is reported as uncertain and never falls back', async ()
   const result = hub.dispatchMcpToPhone('mutation', 10);
   assert.equal((await poll).body, 'mutation');
   assert.equal((await result).error, 'outcome_unknown');
-  const fakeHub = { verifyAccessToken: async () => true, getTunnel: async () => ({ direct_online: true, tunnel_url: 'https://must-not-be-called.invalid' }), dispatchMcpToPhone: async () => ({ ok: false, error: 'outcome_unknown' }) };
+  const fakeHub = {
+    isAuthLocked: async () => false,
+    clearAuthFailures: async () => {},
+    verifyAccessToken: async () => true,
+    getTunnel: async () => ({ direct_online: true, poll_waiters: 1 }),
+    dispatchMcpToPhone: async () => ({ ok: false, error: 'outcome_unknown' }),
+  };
   const env = { PHONE_SECRET: 'test-secret', PHONE_HUB: { idFromName: () => 'test', get: () => fakeHub } };
   const response = await worker.fetch(new Request('https://example.test/mcp', { method: 'POST', headers: { Authorization: 'Bearer test-secret' }, body: '{}' }), env);
   assert.equal(response.status, 504);
@@ -100,23 +105,54 @@ test('offline phone fails fast with structured error_code and stage', async () =
   assert.equal(body.error.data.retryable, true);
 });
 
-test('health endpoint exposes lightweight phone capabilities without telemetry logs', async () => {
+test('anonymous /health hides device fingerprint while authenticated /health exposes details', async () => {
   const { hub } = makeHub();
   hub.updatePhoneHealth({ accessibility_enabled: true, shizuku_ready: true, available_displays: [0, 3] });
   const env = { PHONE_SECRET: 'test-secret', PHONE_HUB: { idFromName: () => 'test', get: () => hub } };
-  const res = await worker.fetch(new Request('https://example.test/health'), env);
-  assert.equal(res.status, 200);
-  const body = await res.json();
-  assert.equal(body.ok, true);
-  assert.equal(body.phone.accessibility_enabled, true);
-  assert.equal(body.phone.shizuku_ready, true);
-  assert.deepEqual(body.phone.available_displays, [0, 3]);
-  assert.equal(body.phone.active_bg_tasks, undefined);
+  const anon = await worker.fetch(new Request('https://example.test/health'), env);
+  assert.equal(anon.status, 200);
+  const anonBody = await anon.json();
+  assert.deepEqual(anonBody, { ok: true, service: 'teapot-phone-agent' });
+
+  const authed = await worker.fetch(new Request('https://example.test/health', {
+    headers: { Authorization: 'bearer test-secret' },
+  }), env);
+  assert.equal(authed.status, 200);
+  const authedBody = await authed.json();
+  assert.equal(authedBody.phone.accessibility_enabled, true);
+  assert.equal(authedBody.phone.shizuku_ready, true);
+  assert.deepEqual(authedBody.phone.available_displays, [0, 3]);
 });
 
-test('explicit /_phone/offline clears tunnel and causes immediate phone_offline response', async () => {
+test('IP-scoped auth lockout prevents cross-IP DoS and blocks brute force', async () => {
   const { hub } = makeHub();
-  hub.setTunnel('https://stale.tunnel.example');
+  for (let i = 0; i < 5; i++) {
+    hub.checkAndRecordAuthAttempt(false, '198.51.100.1');
+  }
+  assert.equal(hub.checkAndRecordAuthAttempt(true, '198.51.100.1').locked, true);
+  assert.equal(hub.checkAndRecordAuthAttempt(true, '203.0.113.9').locked, false);
+});
+
+test('removed /_phone/register returns 404 and oversized /mcp body returns 413', async () => {
+  const { hub } = makeHub();
+  const env = { PHONE_SECRET: 'test-secret', PHONE_HUB: { idFromName: () => 'test', get: () => hub } };
+  const reg = await worker.fetch(new Request('https://example.test/_phone/register', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer test-secret' },
+    body: JSON.stringify({ tunnel_url: 'https://evil.example' }),
+  }), env);
+  assert.equal(reg.status, 404);
+
+  const big = await worker.fetch(new Request('https://example.test/mcp', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer test-secret' },
+    body: 'x'.repeat(270000),
+  }), env);
+  assert.equal(big.status, 413);
+});
+
+test('explicit /_phone/offline causes immediate phone_offline response', async () => {
+  const { hub } = makeHub();
   hub.lastPollAt = Date.now();
   const env = { PHONE_SECRET: 'test-secret', PHONE_HUB: { idFromName: () => 'test', get: () => hub } };
   const off = await worker.fetch(new Request('https://example.test/_phone/offline', {

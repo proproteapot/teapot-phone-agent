@@ -51,8 +51,11 @@ import java.util.zip.ZipOutputStream;
 /** 系统工具集：日历、SAF文档、完整共享存储与相册整理、压缩解压、本机打开文件及闹钟请求。 */
 final class SystemTools {
     private static final Set<String> PROTECTED_TOP_DIRS = new HashSet<>(Arrays.asList(
-            "", "Android", "DCIM", "Pictures", "Movies", "Music", "Download", "Documents"
+            "", "android", "dcim", "pictures", "movies", "music", "download", "documents"
     ));
+    private static boolean isProtectedTopDir(String rel) {
+        return rel == null || PROTECTED_TOP_DIRS.contains(rel.toLowerCase(Locale.ROOT));
+    }
     private final Context context;
 
     SystemTools(Context context) { this.context = context.getApplicationContext(); }
@@ -445,7 +448,7 @@ final class SystemTools {
                 continue;
             }
             String relCheck = relativePath(root, src);
-            if (PROTECTED_TOP_DIRS.contains(relCheck)) {
+            if (isProtectedTopDir(relCheck)) {
                 skipped.put(new JSONObject().put("source", srcRel).put("reason", "禁止移动系统顶层目录"));
                 continue;
             }
@@ -529,7 +532,7 @@ final class SystemTools {
                 continue;
             }
             String rel = relativePath(root, target);
-            if (PROTECTED_TOP_DIRS.contains(rel)) {
+            if (isProtectedTopDir(rel)) {
                 failed.put(new JSONObject().put("path", rel).put("reason", "安全保护：禁止删除系统顶层目录"));
                 continue;
             }
@@ -578,10 +581,37 @@ final class SystemTools {
         byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
         if (bytes.length > 2 * 1024 * 1024) throw new IllegalArgumentException("写入内容超过 2 MiB 限制");
         File f = resolvePath(path);
+        if (f.equals(root)) throw new IllegalArgumentException("不能直接写入存储根目录");
         if (f.exists() && f.isDirectory()) throw new IllegalArgumentException("目标路径是目录，不能写入文本");
-        if (f.getParentFile() != null && !f.getParentFile().exists()) f.getParentFile().mkdirs();
-        try (FileOutputStream out = new FileOutputStream(f, append)) {
-            out.write(bytes);
+        if (java.nio.file.Files.isSymbolicLink(f.toPath())) throw new SecurityException("安全限制：禁止写入符号链接");
+        File parent = f.getParentFile();
+        if (parent == null) throw new IllegalArgumentException("目标路径缺少父目录");
+        if (!parent.exists()) parent.mkdirs();
+        if (append) {
+            long existingSize = f.exists() ? f.length() : 0L;
+            if (existingSize + bytes.length > 2L * 1024 * 1024) {
+                throw new IllegalArgumentException("追加写入后文件总大小超过 2 MiB 安全上限");
+            }
+            try (FileOutputStream out = new FileOutputStream(f, true)) {
+                out.write(bytes);
+            }
+        } else {
+            File tmp = File.createTempFile(".phoneagent-write-", ".tmp", parent);
+            try {
+                try (FileOutputStream out = new FileOutputStream(tmp, false)) {
+                    out.write(bytes);
+                }
+                try {
+                    java.nio.file.Files.move(tmp.toPath(), f.toPath(),
+                            java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                } catch (IOException atomicFallback) {
+                    java.nio.file.Files.move(tmp.toPath(), f.toPath(),
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+            } finally {
+                if (tmp.exists()) tmp.delete();
+            }
         }
         triggerMediaScan(Collections.singletonList(f.getAbsolutePath()));
         return new JSONObject()
@@ -593,11 +623,16 @@ final class SystemTools {
     JSONObject fsZip(JSONArray sourcePaths, String zipPath, int compressionLevel) throws Exception {
         File root = storageRoot();
         if (sourcePaths == null || sourcePaths.length() == 0) throw new IllegalArgumentException("未提供要压缩的源路径");
-        File outZip = resolvePath(zipPath);
-        if (!outZip.getName().toLowerCase(Locale.ROOT).endsWith(".zip")) {
-            outZip = new File(outZip.getParentFile(), outZip.getName() + ".zip").getCanonicalFile();
+        if (zipPath == null || zipPath.trim().isEmpty()) throw new IllegalArgumentException("zip_path 不能为空");
+        String normalizedZipPath = zipPath.trim();
+        if (!normalizedZipPath.toLowerCase(Locale.ROOT).endsWith(".zip")) {
+            normalizedZipPath = normalizedZipPath + ".zip";
         }
-        if (outZip.getParentFile() != null && !outZip.getParentFile().exists()) outZip.getParentFile().mkdirs();
+        File outZip = resolvePath(normalizedZipPath);
+        if (outZip.equals(root) || outZip.getParentFile() == null) {
+            throw new IllegalArgumentException("无效的输出压缩包路径：" + zipPath);
+        }
+        if (!outZip.getParentFile().exists()) outZip.getParentFile().mkdirs();
         int level = (compressionLevel < 0 || compressionLevel > 9) ? 1 : compressionLevel;
         long started = System.currentTimeMillis();
         int[] count = {0};
@@ -620,6 +655,7 @@ final class SystemTools {
 
     private void addToZip(ZipOutputStream zos, File file, String entryName, String skipCanonical, int[] count) throws IOException {
         if (count[0] >= 5000) throw new IOException("单次压缩文件数超过 5000 上限");
+        if (java.nio.file.Files.isSymbolicLink(file.toPath())) return;
         if (file.getCanonicalPath().equals(skipCanonical)) return;
         String normalizedName = entryName.replace('\\', '/');
         if (file.isDirectory()) {
@@ -656,7 +692,9 @@ final class SystemTools {
                 String baseName = zipFile.getName();
                 int dot = baseName.lastIndexOf('.');
                 if (dot > 0) baseName = baseName.substring(0, dot);
-                destRoot = new File(zipFile.getParentFile(), baseName).getCanonicalFile();
+                String parentRel = relativePath(root, zipFile.getParentFile());
+                String defaultDest = parentRel.isEmpty() ? baseName : (parentRel + "/" + baseName);
+                destRoot = resolvePath(defaultDest);
             } else {
                 destRoot = resolvePath(destinationDir);
             }
@@ -666,9 +704,14 @@ final class SystemTools {
         List<String> extractedScan = new ArrayList<>();
         long totalExtractedBytes = 0;
         int extractedFiles = 0;
+        int totalEntries = 0;
         try (ZipInputStream zis = new ZipInputStream(new BufferedInputStream(new FileInputStream(zipFile), 65536))) {
             ZipEntry entry;
             while ((entry = zis.getNextEntry()) != null) {
+                totalEntries++;
+                if (totalEntries > 5000) {
+                    throw new IOException("压缩包条目数超过 5000 安全上限");
+                }
                 if (entries.length() < 500) {
                     entries.put(new JSONObject()
                             .put("name", entry.getName())
@@ -691,8 +734,8 @@ final class SystemTools {
                             int n;
                             while ((n = zis.read(buf)) != -1) {
                                 totalExtractedBytes += n;
-                                if (totalExtractedBytes > 4L * 1024 * 1024 * 1024) {
-                                    throw new IOException("解压总大小超过 4 GiB 安全上限");
+                                if (totalExtractedBytes > 512L * 1024 * 1024) {
+                                    throw new IOException("解压总大小超过 512 MiB 安全上限");
                                 }
                                 bos.write(buf, 0, n);
                             }
@@ -722,8 +765,13 @@ final class SystemTools {
         File root = storageRoot();
         File file = resolvePath(path);
         if (!file.exists() || !file.isFile()) throw new IllegalArgumentException("要打开的文件不存在：" + path);
-        Uri uri = LocalFileProvider.uriForFile(file);
+        String lowerName = file.getName().toLowerCase(Locale.ROOT);
         String mime = guessMimeType(file.getName());
+        if (lowerName.endsWith(".apk") || lowerName.endsWith(".xapk") || lowerName.endsWith(".apks")
+                || "application/vnd.android.package-archive".equalsIgnoreCase(mime)) {
+            throw new SecurityException("安全限制：禁止远程调用系统打开安装包文件（.apk）");
+        }
+        Uri uri = LocalFileProvider.uriForFile(file);
         Intent view = new Intent(Intent.ACTION_VIEW)
                 .setDataAndType(uri, mime)
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -747,7 +795,7 @@ final class SystemTools {
         if (launchedDirectly && ScreenControlService.instance != null) {
             try {
                 Thread.sleep(800);
-                out.put("screen", ScreenControlService.instance.captureSnapshot());
+                out.put("screen", ScreenControlService.authorized().captureSnapshot());
             } catch (Exception ignored) { }
         }
         return out;
@@ -855,6 +903,13 @@ final class SystemTools {
         if (targetPkg == null) {
             throw new IllegalArgumentException("未找到匹配「" + q + "」的已安装应用，可先调用 list_installed_apps 查询");
         }
+        if (ScreenControlService.isProtectedPackage(targetPkg)) {
+            throw new SecurityException("安全保护：禁止远程启动本应用、系统权限弹窗、安装器或 Shizuku（" + targetPkg + "）");
+        }
+        String safeUrl = null;
+        if (url != null && !url.trim().isEmpty()) {
+            safeUrl = ShizukuBridge.sanitizeHttpUrl(url);
+        }
 
         int sleepMs = Math.max(300, Math.min(5000, waitMs));
         if (displayId > android.view.Display.DEFAULT_DISPLAY) {
@@ -864,8 +919,8 @@ final class SystemTools {
             }
             JSONObject shizukuLaunch = ShizukuBridge.startAppOnDisplay(
                     targetPkg,
-                    (url != null && !url.trim().isEmpty()) ? Intent.ACTION_VIEW : null,
-                    (url != null && !url.trim().isEmpty()) ? url.trim() : null,
+                    safeUrl != null ? Intent.ACTION_VIEW : null,
+                    safeUrl,
                     displayId
             );
             Thread.sleep(sleepMs);
@@ -900,8 +955,7 @@ final class SystemTools {
 
             if (ScreenControlService.instance != null) {
                 try {
-                    ScreenApprovalActivity.autoActivate(context);
-                    result.put("screen", ScreenControlService.instance.captureSnapshot(displayId));
+                    result.put("screen", ScreenControlService.authorized().captureSnapshot(displayId));
                 } catch (Exception e) {
                     result.put("screen_error", e.getMessage());
                 }
@@ -910,8 +964,8 @@ final class SystemTools {
         }
 
         Intent launch;
-        if (url != null && !url.trim().isEmpty()) {
-            launch = new Intent(Intent.ACTION_VIEW, Uri.parse(url.trim()));
+        if (safeUrl != null) {
+            launch = new Intent(Intent.ACTION_VIEW, Uri.parse(safeUrl));
             launch.setPackage(targetPkg);
         } else {
             launch = pm.getLaunchIntentForPackage(targetPkg);
@@ -936,8 +990,7 @@ final class SystemTools {
 
         if (ScreenControlService.instance != null) {
             try {
-                ScreenApprovalActivity.autoActivate(context);
-                JSONObject snap = ScreenControlService.instance.captureSnapshot(displayId);
+                JSONObject snap = ScreenControlService.authorized().captureSnapshot(displayId);
                 boolean inTarget = targetPkg.equals(snap.optString("foreground_package", ""));
                 result.put("ok", true)
                       .put("goal_reached", inTarget)

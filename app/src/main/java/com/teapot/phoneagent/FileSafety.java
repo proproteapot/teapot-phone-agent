@@ -17,8 +17,13 @@ final class FileSafety {
     }
 
     static void safeCopyFile(File src, File dst, boolean overwrite) throws IOException {
+        if (Files.isSymbolicLink(src.toPath()) || Files.isSymbolicLink(dst.toPath())) {
+            throw new IOException("安全限制：禁止复制或覆盖符号链接");
+        }
         if (src.getCanonicalFile().equals(dst.getCanonicalFile())) throw new IOException("源文件和目标文件相同");
-        File tmp = File.createTempFile(".phoneagent-copy-", ".tmp", dst.getParentFile());
+        File parent = dst.getParentFile();
+        if (parent == null) throw new IOException("目标路径缺少父目录");
+        File tmp = File.createTempFile(".phoneagent-copy-", ".tmp", parent);
         try {
             try (InputStream in = Files.newInputStream(src.toPath()); OutputStream out = Files.newOutputStream(tmp.toPath())) {
                 byte[] buffer = new byte[65536];

@@ -49,6 +49,23 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public final class ScreenControlService extends AccessibilityService {
     static volatile ScreenControlService instance;
+    private static final Set<String> PROTECTED_PACKAGES = new java.util.HashSet<>(java.util.Arrays.asList(
+            "com.teapot.phoneagent",
+            "com.android.permissioncontroller",
+            "com.google.android.permissioncontroller",
+            "com.lbe.security.miui",
+            "com.miui.securitycenter",
+            "moe.shizuku.privileged.api",
+            "com.android.packageinstaller",
+            "com.google.android.packageinstaller",
+            "com.miui.packageinstaller"
+    ));
+
+    static boolean isProtectedPackage(String pkg) {
+        if (pkg == null || pkg.trim().isEmpty()) return false;
+        return PROTECTED_PACKAGES.contains(pkg.trim().toLowerCase(Locale.ROOT));
+    }
+
     private View overlay;
     private TextView overlayLabel;
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -188,6 +205,7 @@ public final class ScreenControlService extends AccessibilityService {
      * 包含当前前台应用包名/名称、窗口 ID/标题、屏幕尺寸、可见文本摘要、带 index/view_id/中心坐标的可交互节点列表及页面签名。
      */
     JSONObject captureSnapshot(int displayId) throws Exception {
+        ScreenApprovalActivity.checkDeviceUnlocked(this);
         if (!ScreenApprovalActivity.allowed()) ScreenApprovalActivity.autoActivate(this);
         DisplayMetrics dm = getDisplayMetricsFor(displayId);
         AccessibilityWindowInfo bestWin = findBestWindowInfo(displayId);
@@ -202,10 +220,13 @@ public final class ScreenControlService extends AccessibilityService {
         Set<String> visibleTexts = new LinkedHashSet<>();
         List<Rect> boundsCache = new ArrayList<>();
         StringBuilder sigBuilder = new StringBuilder().append(displayId).append('|').append(fgPkg).append('|').append(windowId).append('|');
+        boolean isProtected = isProtectedPackage(fgPkg);
 
         if (root != null) {
             try {
-                walkSnapshot(root, interactive, visibleTexts, boundsCache, sigBuilder, 0, dm.widthPixels, dm.heightPixels);
+                if (!isProtected) {
+                    walkSnapshot(root, interactive, visibleTexts, boundsCache, sigBuilder, 0, dm.widthPixels, dm.heightPixels);
+                }
             } finally {
                 root.recycle();
             }
@@ -223,9 +244,10 @@ public final class ScreenControlService extends AccessibilityService {
                 .put("display_id", displayId)
                 .put("window_found", root != null)
                 .put("window_id", windowId)
-                .put("window_title", windowTitle)
+                .put("window_title", isProtected ? "" : windowTitle)
                 .put("foreground_package", fgPkg)
                 .put("foreground_app", fgApp)
+                .put("protected", isProtected)
                 .put("screen_size", new JSONObject().put("width", dm.widthPixels).put("height", dm.heightPixels))
                 .put("ui_signature", signature)
                 .put("visible_texts", textsArr)
@@ -410,6 +432,26 @@ public final class ScreenControlService extends AccessibilityService {
         String beforePkg = before.optString("foreground_package", "");
         String beforeWinId = String.valueOf(before.optInt("window_id", -1));
         String beforeWinTitle = before.optString("window_title", "");
+
+        if (isProtectedPackage(beforePkg)) {
+            JSONObject redactedScreen = new JSONObject()
+                    .put("display_id", displayId)
+                    .put("foreground_package", beforePkg)
+                    .put("protected", true);
+            return new JSONObject()
+                    .put("ok", false)
+                    .put("action", actionName)
+                    .put("display_id", displayId)
+                    .put("error_code", "system_rejected")
+                    .put("stage", "protected_package_guard")
+                    .put("retryable", false)
+                    .put("action_delivered", false)
+                    .put("action_submitted", false)
+                    .put("ui_changed", false)
+                    .put("goal_reached", false)
+                    .put("feedback", "❌ 安全保护：禁止自动操作本应用、系统权限弹窗、安装器或 Shizuku 界面（" + beforePkg + "）。请由用户本机手动操作。")
+                    .put("screen", redactedScreen);
+        }
 
         if (displayId > Display.DEFAULT_DISPLAY && !before.optBoolean("window_found", false)) {
             return new JSONObject()
@@ -1041,10 +1083,23 @@ public final class ScreenControlService extends AccessibilityService {
      * Android 11+ (API 30+) 免弹窗无障碍原生截图（支持指定 display_id），返回压缩后的 JPEG Base64 字符串。
      */
     String captureScreenshotBase64(int displayId, int maxWidth, int quality) throws Exception {
+        ScreenApprovalActivity.checkDeviceUnlocked(this);
         if (Build.VERSION.SDK_INT < 30) {
             throw new UnsupportedOperationException("当前 Android 版本低于 11，不支持无障碍直接截图");
         }
         getDisplayMetricsFor(displayId); // 校验目标屏幕存在
+        AccessibilityWindowInfo win = findBestWindowInfo(displayId);
+        AccessibilityNodeInfo root = win != null ? win.getRoot() : (displayId == Display.DEFAULT_DISPLAY ? findBestRootWindow() : null);
+        if (root != null) {
+            try {
+                String fgPkg = root.getPackageName() != null ? root.getPackageName().toString() : "";
+                if (isProtectedPackage(fgPkg)) {
+                    throw new SecurityException("安全保护：禁止对本应用、系统权限弹窗、安装器或 Shizuku 界面截图（" + fgPkg + "）");
+                }
+            } finally {
+                root.recycle();
+            }
+        }
         final CountDownLatch latch = new CountDownLatch(1);
         final AtomicReference<Bitmap> bitmapRef = new AtomicReference<>(null);
         final AtomicReference<String> errRef = new AtomicReference<>(null);

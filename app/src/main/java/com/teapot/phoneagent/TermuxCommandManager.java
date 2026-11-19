@@ -10,11 +10,13 @@ import org.json.JSONObject;
 import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.URI;
 import java.net.URL;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -38,6 +40,8 @@ final class TermuxCommandManager {
     private static final String KEY_TASKS = "tasks_json";
     private static final String KEY_EXECUTION_ENABLED = "termux_exec_enabled";
     private static final String TASK_DIR_EXPR = "$HOME/.phone-agent-tasks";
+    private static final Pattern VALID_TASK_ID = Pattern.compile("^t_[0-9]+_[0-9a-f]+$");
+    private static final int BRIDGE_LOCAL_PORT = 8765;
 
     private static final Map<String, TaskRecord> TASKS = new ConcurrentHashMap<>();
     private static final Map<String, SyncWaiter> SYNC_WAITERS = new ConcurrentHashMap<>();
@@ -138,7 +142,7 @@ final class TermuxCommandManager {
                 JSONObject o = arr.optJSONObject(i);
                 if (o == null) continue;
                 String id = o.optString("task_id", "");
-                if (id.isEmpty()) continue;
+                if (!isValidTaskId(id)) continue;
                 TaskRecord r = new TaskRecord(
                         id,
                         o.optString("command", ""),
@@ -227,14 +231,21 @@ final class TermuxCommandManager {
             throw new IllegalArgumentException("command 不能为空");
         }
         ensureTermuxReady(context);
+        String cleanProbeUrl = probeUrl == null ? "" : probeUrl.trim();
+        if (!cleanProbeUrl.isEmpty()) {
+            validateLoopbackProbeUrl(cleanProbeUrl);
+        }
+        if (probePort != 0) {
+            validateLoopbackPort(probePort);
+        }
 
         String normalizedMode = "service".equalsIgnoreCase(mode) ? "service" : "oneshot";
-        String taskId = "t_" + System.currentTimeMillis() + "_" + Integer.toHexString(RNG.nextInt(0xFFFF));
+        String taskId = "t_" + System.currentTimeMillis() + "_" + randomHex(8);
         String cleanWorkdir = (workdir == null || workdir.trim().isEmpty()) ? "/data/data/com.termux/files/home" : workdir.trim();
 
         TaskRecord record = new TaskRecord(taskId, command.trim(), cleanWorkdir, normalizedMode,
                 serviceName == null ? "" : serviceName.trim(),
-                probeUrl == null ? "" : probeUrl.trim(),
+                cleanProbeUrl,
                 probePort, System.currentTimeMillis());
         TASKS.put(taskId, record);
         persist(context);
@@ -322,9 +333,15 @@ final class TermuxCommandManager {
             persist(context);
             return new JSONObject().put("ok", true).put("tasks", all);
         }
-        TaskRecord r = TASKS.get(taskId.trim());
+        String cleanId = taskId.trim();
+        if (!isValidTaskId(cleanId)) throw new IllegalArgumentException("无效的任务 ID");
+        TaskRecord r = TASKS.get(cleanId);
         if (r == null) throw new IllegalArgumentException("未找到任务: " + taskId);
-        refreshLiveStatus(context, r);
+        if (isExecutionEnabled(context)) {
+            refreshLiveStatus(context, r);
+        } else {
+            updateProbe(r);
+        }
         persist(context);
         JSONObject out = r.toJson();
         out.put("ok", true);
@@ -333,7 +350,10 @@ final class TermuxCommandManager {
 
     static JSONObject logs(Context context, String taskId, int tailLines) throws Exception {
         ensureLoaded(context);
-        TaskRecord r = TASKS.get(taskId == null ? "" : taskId.trim());
+        ensureTermuxReady(context);
+        String cleanId = taskId == null ? "" : taskId.trim();
+        if (!isValidTaskId(cleanId)) throw new IllegalArgumentException("无效的任务 ID");
+        TaskRecord r = TASKS.get(cleanId);
         if (r == null) throw new IllegalArgumentException("未找到任务: " + taskId);
         int lines = Math.max(10, Math.min(300, tailLines <= 0 ? 80 : tailLines));
         String tail = fetchLogTail(context, r, lines);
@@ -349,7 +369,9 @@ final class TermuxCommandManager {
     static JSONObject stop(Context context, String taskId, int waitMs) throws Exception {
         ensureLoaded(context);
         ensureTermuxReady(context);
-        TaskRecord r = TASKS.get(taskId == null ? "" : taskId.trim());
+        String cleanId = taskId == null ? "" : taskId.trim();
+        if (!isValidTaskId(cleanId)) throw new IllegalArgumentException("无效的任务 ID");
+        TaskRecord r = TASKS.get(cleanId);
         if (r == null) throw new IllegalArgumentException("未找到任务: " + taskId);
 
         String stopScript = "TDIR=\"" + TASK_DIR_EXPR + "\"; "
@@ -466,7 +488,10 @@ final class TermuxCommandManager {
     }
 
     private static CallbackResult execSync(Context context, String bashCmd, String workdir, String taskId, int timeoutMs) throws Exception {
-        String reqId = "req_" + REQ_SEQ.incrementAndGet() + "_" + Integer.toHexString(RNG.nextInt(0xFFFF));
+        if (!isExecutionEnabled(context)) {
+            throw new SecurityException("后台 Termux 命令功能默认关闭；如需使用，请在手机端「设置与权限管理」中手动开启");
+        }
+        String reqId = "req_" + REQ_SEQ.incrementAndGet() + "_" + randomHex(16);
         SyncWaiter waiter = new SyncWaiter();
         SYNC_WAITERS.put(reqId, waiter);
         try {
@@ -497,6 +522,7 @@ final class TermuxCommandManager {
     }
 
     private static String buildServiceLaunchScript(TaskRecord r) {
+        if (!isValidTaskId(r.taskId)) throw new IllegalArgumentException("无效的任务 ID");
         String inner = r.command + "; echo $? > \"" + TASK_DIR_EXPR + "/" + r.taskId + ".exit\"";
         return "TDIR=\"" + TASK_DIR_EXPR + "\"; mkdir -p \"$TDIR\"; "
                 + "LOG=\"$TDIR/" + r.taskId + ".log\"; "
@@ -507,11 +533,12 @@ final class TermuxCommandManager {
     }
 
     private static String buildOneshotScript(TaskRecord r) {
+        if (!isValidTaskId(r.taskId)) throw new IllegalArgumentException("无效的任务 ID");
         return "TDIR=\"" + TASK_DIR_EXPR + "\"; mkdir -p \"$TDIR\"; "
                 + "LOG=\"$TDIR/" + r.taskId + ".log\"; "
                 + "PGID_FILE=\"$TDIR/" + r.taskId + ".pgid\"; "
                 + "echo $$ > \"$PGID_FILE\"; "
-                + "{ " + r.command + "; } > \"$LOG\" 2>&1; EC=$?; "
+                + "/data/data/com.termux/files/usr/bin/bash -lc '" + escapeSingle(r.command) + "' > \"$LOG\" 2>&1; EC=$?; "
                 + "echo \"$EC\" > \"$TDIR/" + r.taskId + ".exit\"; "
                 + "tail -c 16384 \"$LOG\" 2>/dev/null; exit $EC";
     }
@@ -548,6 +575,53 @@ final class TermuxCommandManager {
         r.httpStatus = p.statusCode;
     }
 
+    private static boolean isValidTaskId(String id) {
+        return id != null && VALID_TASK_ID.matcher(id).matches();
+    }
+
+    private static String randomHex(int byteLen) {
+        byte[] bytes = new byte[byteLen];
+        RNG.nextBytes(bytes);
+        StringBuilder sb = new StringBuilder(byteLen * 2);
+        for (byte b : bytes) {
+            sb.append(Character.forDigit((b >> 4) & 0xF, 16));
+            sb.append(Character.forDigit(b & 0xF, 16));
+        }
+        return sb.toString();
+    }
+
+    private static void validateLoopbackPort(int port) {
+        if (port < 1 || port > 65535 || port == BRIDGE_LOCAL_PORT) {
+            throw new IllegalArgumentException("probe_port 必须是 1-65535 的本机端口，且禁止探测内部桥接端口 " + BRIDGE_LOCAL_PORT);
+        }
+    }
+
+    private static String validateLoopbackProbeUrl(String rawUrl) {
+        try {
+            URI uri = URI.create(rawUrl.trim());
+            String scheme = uri.getScheme();
+            if (!"http".equalsIgnoreCase(scheme)) {
+                throw new IllegalArgumentException("probe_url 仅支持本机 http:// 地址");
+            }
+            if (uri.getRawUserInfo() != null) {
+                throw new IllegalArgumentException("probe_url 不允许包含用户信息");
+            }
+            String host = uri.getHost();
+            if (host == null || (!"127.0.0.1".equals(host) && !"localhost".equalsIgnoreCase(host))) {
+                throw new IllegalArgumentException("安全限制：probe_url 仅允许探测本机回环地址 (127.0.0.1 / localhost)");
+            }
+            int port = uri.getPort();
+            if (port != -1) {
+                validateLoopbackPort(port);
+            }
+            return uri.toASCIIString();
+        } catch (IllegalArgumentException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalArgumentException("probe_url 格式无效");
+        }
+    }
+
     private static String escapeSingle(String s) {
         return s.replace("'", "'\\''");
     }
@@ -559,13 +633,24 @@ final class TermuxCommandManager {
     }
 
     static HttpProbeResult probeLocal(String probeUrl, int probePort) {
-        String urlStr = (probeUrl != null && !probeUrl.isEmpty())
-                ? probeUrl
-                : (probePort > 0 ? "http://127.0.0.1:" + probePort + "/" : "");
+        String urlStr = "";
+        if (probeUrl != null && !probeUrl.trim().isEmpty()) {
+            try {
+                urlStr = validateLoopbackProbeUrl(probeUrl);
+            } catch (IllegalArgumentException ignored) {
+                return new HttpProbeResult(false, 0);
+            }
+        } else if (probePort > 0) {
+            if (probePort > 65535 || probePort == BRIDGE_LOCAL_PORT) {
+                return new HttpProbeResult(false, 0);
+            }
+            urlStr = "http://127.0.0.1:" + probePort + "/";
+        }
         if (!urlStr.isEmpty()) {
             HttpURLConnection conn = null;
             try {
                 conn = (HttpURLConnection) new URL(urlStr).openConnection();
+                conn.setInstanceFollowRedirects(false);
                 conn.setConnectTimeout(800);
                 conn.setReadTimeout(800);
                 conn.setRequestMethod("GET");
@@ -576,7 +661,7 @@ final class TermuxCommandManager {
                 if (conn != null) conn.disconnect();
             }
         }
-        if (probePort > 0) {
+        if (probePort >= 1 && probePort <= 65535 && probePort != BRIDGE_LOCAL_PORT) {
             try (Socket s = new Socket()) {
                 s.connect(new InetSocketAddress("127.0.0.1", probePort), 600);
                 return new HttpProbeResult(true, 0);

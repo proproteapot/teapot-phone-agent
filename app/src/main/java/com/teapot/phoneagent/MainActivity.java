@@ -132,7 +132,13 @@ public final class MainActivity extends Activity {
         copyToken.setOnClickListener(v -> {
             String token = new OAuthManager(this).getOrCreatePairingToken();
             android.content.ClipboardManager cm = getSystemService(android.content.ClipboardManager.class);
-            cm.setPrimaryClip(android.content.ClipData.newPlainText("phone-agent-token", token));
+            android.content.ClipData clip = android.content.ClipData.newPlainText("phone-agent-token", token);
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                android.os.PersistableBundle extras = new android.os.PersistableBundle();
+                extras.putBoolean(android.content.ClipDescription.EXTRA_IS_SENSITIVE, true);
+                clip.getDescription().setExtras(extras);
+            }
+            cm.setPrimaryClip(clip);
             android.widget.Toast.makeText(this, "已复制连接码（开头：" + token.substring(0, Math.min(6, token.length())) + "...）", android.widget.Toast.LENGTH_SHORT).show();
         });
         copyRow.addView(copyToken);
@@ -242,23 +248,49 @@ public final class MainActivity extends Activity {
         });
         settingsPanel.addView(startLocalOnly);
 
-        Button rotateToken = new Button(this);
-        rotateToken.setText("撤销云端和本机 OAuth 授权");
-        rotateToken.setOnClickListener(v -> {
-            rotateToken.setEnabled(false);
+        Button revokeOAuth = new Button(this);
+        revokeOAuth.setText("撤销云端和本机 OAuth 授权");
+        revokeOAuth.setOnClickListener(v -> {
+            revokeOAuth.setEnabled(false);
             new Thread(() -> {
-                boolean ok = false;
-                try { ok = TunnelManager.revokeCloudOAuthTokens(this); } catch (Exception ignored) { }
-                if (ok) new OAuthManager(this).revokeLocalOAuthTokens();
-                final boolean result = ok;
+                new OAuthManager(this).revokeLocalOAuthTokens();
+                boolean cloudConfigured = !TunnelManager.getSavedCustomDomain(this).trim().isEmpty();
+                boolean cloudOk = false;
+                if (cloudConfigured) {
+                    try { cloudOk = TunnelManager.revokeCloudOAuthTokens(this); } catch (Exception ignored) { }
+                }
+                final boolean cConf = cloudConfigured;
+                final boolean cOk = cloudOk;
                 runOnUiThread(() -> {
-                    rotateToken.setEnabled(true);
-                    android.widget.Toast.makeText(this, result ? "已撤销 OAuth 授权；连接码未更改" : "云端撤销失败，授权未更改", android.widget.Toast.LENGTH_LONG).show();
+                    revokeOAuth.setEnabled(true);
+                    String msg = !cConf ? "已撤销本机 OAuth 授权（未配置云端网关）"
+                            : (cOk ? "已撤销云端与本机 OAuth 授权；连接码未更改"
+                            : "已撤销本机 OAuth 授权；云端撤销失败，请检查网络或重新配置 PHONE_SECRET");
+                    android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show();
                     refresh();
                 });
             }).start();
         });
-        settingsPanel.addView(rotateToken);
+        settingsPanel.addView(revokeOAuth);
+
+        Button resetPairing = new Button(this);
+        resetPairing.setText("重置连接码并吊销全部授权");
+        resetPairing.setOnClickListener(v -> new android.app.AlertDialog.Builder(this)
+                .setTitle("确认重置连接码？")
+                .setMessage("重置后将生成全新的本机连接码，并立即吊销所有已签发的 OAuth 令牌。若使用了 Cloudflare 网关，需要同步更新 Worker 的 PHONE_SECRET。")
+                .setPositiveButton("确认重置", (d, w) -> {
+                    new Thread(() -> {
+                        try { TunnelManager.revokeCloudOAuthTokens(this); } catch (Exception ignored) { }
+                        new OAuthManager(this).rotatePairingTokenAndRevokeAll();
+                        runOnUiThread(() -> {
+                            android.widget.Toast.makeText(this, "已生成新连接码并吊销全部授权，请更新云端 PHONE_SECRET", android.widget.Toast.LENGTH_LONG).show();
+                            refresh();
+                        });
+                    }).start();
+                })
+                .setNegativeButton("取消", null)
+                .show());
+        settingsPanel.addView(resetPairing);
 
         setContentView(scroll);
         refresh();

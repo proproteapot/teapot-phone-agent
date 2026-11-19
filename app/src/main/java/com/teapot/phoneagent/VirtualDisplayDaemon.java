@@ -2,7 +2,6 @@ package com.teapot.phoneagent;
 
 import android.content.Context;
 import android.content.ContextWrapper;
-import android.graphics.Bitmap;
 import android.graphics.PixelFormat;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
@@ -13,17 +12,15 @@ import android.os.Handler;
 import android.os.Looper;
 import android.view.Surface;
 import java.io.BufferedReader;
-import java.io.FileOutputStream;
 import java.io.InputStreamReader;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 
 /**
  * 由 Shizuku (uid=2000 shell) 通过 app_process 启动的离屏虚拟屏守护进程。
- * 参照 scrcpy 机制使用轻量 FakeContext + DisplayManager.createVirtualDisplay + ImageReader，
- * 完全避开 Android 16 上 ShizukuServiceStarter 的 LoadedApk NPE，实现主屏零遮挡的真离屏虚拟屏。
+ * 遵循最小权限原则：仅负责创建与维护离屏 VirtualDisplay 并在收到 QUIT/EOF 时销毁，
+ * 不包含任何特权文件写入能力。
  */
 public final class VirtualDisplayDaemon {
     private static final int VIRTUAL_DISPLAY_FLAG_PUBLIC = 1 << 0;
@@ -81,7 +78,7 @@ public final class VirtualDisplayDaemon {
             ImageReader reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2);
             reader.setOnImageAvailableListener(r -> {
                 try (Image img = r.acquireLatestImage()) {
-                    // 消费最新帧，保持 Surface 活跃
+                    // 消费最新帧，保持离屏 Surface 活跃
                 } catch (Throwable ignored) { }
             }, new Handler(Looper.getMainLooper()));
             activeReader = reader;
@@ -138,18 +135,11 @@ public final class VirtualDisplayDaemon {
             System.out.println("READY:" + displayId + ":" + usedFlags);
             System.out.flush();
 
-            // 后台线程读取 stdin 控制指令（QUIT 或 SCREENSHOT <path> <quality>）
             Thread cmdThread = new Thread(() -> {
                 try (BufferedReader br = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
                     String line;
                     while ((line = br.readLine()) != null) {
-                        String trimmed = line.trim();
-                        if ("QUIT".equalsIgnoreCase(trimmed)) {
-                            break;
-                        }
-                        if (trimmed.startsWith("SCREENSHOT:")) {
-                            handleScreenshotCmd(trimmed.substring("SCREENSHOT:".length()));
-                        }
+                        if ("QUIT".equalsIgnoreCase(line.trim())) break;
                     }
                 } catch (Throwable ignored) {
                 } finally {
@@ -182,7 +172,6 @@ public final class VirtualDisplayDaemon {
     private static VirtualDisplay createVirtualDisplayCompat(
             Context fakeCtx, DisplayManager dm, String name, int width, int height, int dpi, Surface surface, int flags
     ) throws Exception {
-        // 优先通过 DisplayManagerGlobal + VirtualDisplayConfig（与 scrcpy v3+/v5 相同，免 Context 系统服务依赖）
         try {
             Class<?> dmgClass = Class.forName("android.hardware.display.DisplayManagerGlobal");
             Object dmg = dmgClass.getMethod("getInstance").invoke(null);
@@ -212,58 +201,6 @@ public final class VirtualDisplayDaemon {
             return dm.createVirtualDisplay(name, width, height, dpi, surface, flags);
         }
         throw new IllegalStateException("无法通过 DisplayManagerGlobal 或 DisplayManager 创建离屏虚拟屏");
-    }
-
-    private static void handleScreenshotCmd(String arg) {
-        try {
-            String[] parts = arg.split("\\|");
-            String outPath = parts[0];
-            int maxW = parts.length > 1 ? parseInt(parts[1], 540) : 540;
-            int quality = parts.length > 2 ? parseInt(parts[2], 65) : 65;
-            ImageReader r = activeReader;
-            if (r == null) {
-                System.out.println("SHOT_ERR:no_reader");
-                System.out.flush();
-                return;
-            }
-            Image img = r.acquireLatestImage();
-            if (img == null) {
-                System.out.println("SHOT_ERR:no_frame");
-                System.out.flush();
-                return;
-            }
-            try {
-                Image.Plane[] planes = img.getPlanes();
-                ByteBuffer buf = planes[0].getBuffer();
-                int pixelStride = planes[0].getPixelStride();
-                int rowStride = planes[0].getRowStride();
-                int w = img.getWidth();
-                int h = img.getHeight();
-                int rowPadding = rowStride - pixelStride * w;
-                Bitmap raw = Bitmap.createBitmap(w + rowPadding / pixelStride, h, Bitmap.Config.ARGB_8888);
-                raw.copyPixelsFromBuffer(buf);
-                Bitmap cropped = Bitmap.createBitmap(raw, 0, 0, w, h);
-                if (cropped != raw) raw.recycle();
-                Bitmap finalBmp = cropped;
-                if (w > maxW) {
-                    int targetH = Math.round((float) h * maxW / w);
-                    finalBmp = Bitmap.createScaledBitmap(cropped, maxW, targetH, true);
-                    if (finalBmp != cropped) cropped.recycle();
-                }
-                try (FileOutputStream fos = new FileOutputStream(outPath)) {
-                    finalBmp.compress(Bitmap.CompressFormat.JPEG, Math.max(30, Math.min(90, quality)), fos);
-                } finally {
-                    finalBmp.recycle();
-                }
-                System.out.println("SHOT_OK:" + outPath);
-                System.out.flush();
-            } finally {
-                img.close();
-            }
-        } catch (Throwable t) {
-            System.out.println("SHOT_ERR:" + t.getMessage());
-            System.out.flush();
-        }
     }
 
     private static void cleanup() {

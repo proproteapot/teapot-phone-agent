@@ -6,10 +6,10 @@
  * 将手机端运行的 `127.0.0.1:8765/mcp` (通过 ADB 转发到电脑 `127.0.0.1:18765/mcp`)
  * 包装为标准 stdio MCP Server，供 Antigravity、Claude Code、Codex、Cursor、Chatbox 等直接挂载调用。
  *
- * 环境变量（均可选，默认自动通过 ADB 探测）：
- * - PHONE_AGENT_URL: 默认 http://127.0.0.1:18765/mcp
- * - PHONE_AGENT_TOKEN: 手机端 Bearer Token（未设置时自动通过 adb run-as 读取）
- * - ADB_SERIAL: 指定设备序列号（默认自动选择当前连接设备）
+ * 环境变量：
+ * - PHONE_AGENT_URL: 可选，默认 http://127.0.0.1:18765/mcp
+ * - PHONE_AGENT_TOKEN: 必填，手机端「复制连接码」获取的本机配对令牌
+ * - ADB_SERIAL: 可选，指定设备序列号（默认自动选择当前连接设备）
  */
 
 import { execFileSync } from 'node:child_process';
@@ -54,12 +54,12 @@ async function forwardRpc(message) {
   const body = JSON.stringify(message);
   let res;
   try {
-    res = await fetch(ENDPOINT, { method: 'POST', headers, body });
+    res = await fetch(ENDPOINT, { method: 'POST', headers, body, signal: AbortSignal.timeout(25000) });
   } catch (err) {
     // 尝试重新执行一次 adb forward 后重试
     cachedToken = ensureForwardAndToken();
     headers['Authorization'] = `Bearer ${cachedToken}`;
-    res = await fetch(ENDPOINT, { method: 'POST', headers, body });
+    res = await fetch(ENDPOINT, { method: 'POST', headers, body, signal: AbortSignal.timeout(25000) });
   }
   if (res.status === 202 || message.id === undefined) return null;
   const text = await res.text();

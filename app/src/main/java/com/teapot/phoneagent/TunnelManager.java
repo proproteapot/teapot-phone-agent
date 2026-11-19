@@ -54,7 +54,7 @@ final class TunnelManager {
     }
 
     static boolean isAutoStartEnabled(Context ctx) {
-        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_AUTO_START, true);
+        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_AUTO_START, false);
     }
 
     static void setAutoStartEnabled(Context ctx, boolean enabled) {

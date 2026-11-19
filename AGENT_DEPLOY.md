@@ -14,33 +14,32 @@
 > 本章节直接面向执行部署任务的 **AI Agent** 编写。请按顺序执行，每一步均有明确验收标准。
 
 ### ⚠️ Agent 执行红线（必须遵守）
-1. **严禁提交或打印密钥**：不得将用户的 `PHONE_SECRET`、配对令牌、Cloudflare API Token、OAuth Token 或私有 `cloud/wrangler.jsonc` 写入日志、回复正文或 git 提交。
+1. **严禁提交或打印密钥**：不得将用户的 `PHONE_SECRET`、配对令牌、Cloudflare API Token、OAuth Token 或私有 `cloud/wrangler.local.jsonc` 写入日志、回复正文或 git 提交。
 2. **不得绕过人工授权边界**：Cloudflare 登录（`wrangler login`）、手机端无障碍开启、Shizuku 授权弹窗、手机端安全开关开启及 ChatGPT OAuth 授权必须由用户本人完成，Agent 只负责引导与验收。
-3. **不得修改安全边界**：不要放宽 `cloud/worker.js` 的 PKCE/Origin/redirect_uri 校验，不要关闭 `network_security_config.xml`，不要在公开 `/health` 暴露请求日志。
+3. **不得修改安全边界**：不要放宽 `cloud/worker.js` 的 PKCE/Origin/redirect_uri/IP 限流校验，不要关闭 `network_security_config.xml`，不要在匿名 `/health` 暴露设备详情或请求日志。
 
 ### Step 0：环境预检
 在仓库根目录执行只读探测，确认以下工具可用：
 - `node -v`（要求 >= 20）
 - `java -version`（要求 JDK 17）
 - `adb devices`（确认目标 Android 真机处于 `device` 状态）
-- `npx wrangler whoami`（若未登录，暂停请用户手动执行 `npx wrangler login`）
+- `npx wrangler whoami`（若未登录，暂停请用户手动执行 `npx wrangler login`；免费 Cloudflare 账号即可，**无需购买域名**）
 - 确认 `ANDROID_HOME` 指向已安装 Android SDK（API 35）的目录。
 
-### Step 1：运行 Worker 单测并部署 Cloudflare 网关
+### Step 1：运行 Worker 单测并部署 Cloudflare 网关（免费 `*.workers.dev`，0 域名费用）
 1. 运行单元测试（必须全部通过）：
    ```bash
    node --test cloud/worker.test.cjs
    ```
-2. 复制配置模板（`cloud/wrangler.jsonc` 已被 `.gitignore` 忽略，不会进入 git）：
-   ```bash
-   cp cloud/wrangler.jsonc.example cloud/wrangler.jsonc
-   ```
-   - 如用户有自定义域名，询问用户后在 `cloud/wrangler.jsonc` 中取消 `routes` 注释并填入域名；否则直接使用默认 `workers.dev` 域名。
+2. 确定配置文件：
+   - **无自定义域名（默认，$0 免费套餐）**：直接使用仓库内置的 `cloud/wrangler.jsonc`（启用了 `workers_dev: true` 和 SQLite Durable Object）；
+   - **有自定义域名（可选）**：复制 `cloud/wrangler.jsonc.example` 为 `cloud/wrangler.local.jsonc`（已被 `.gitignore` 忽略），填入自定义域名 `routes`。
 3. 部署 Worker：
    ```bash
-   npx wrangler deploy -c cloud/wrangler.jsonc
+   cd cloud && npm install
+   npx wrangler deploy -c wrangler.jsonc
    ```
-   记录部署输出中的公网 HTTPS URL（记为 `<WORKER_URL>`）。
+   记录部署输出中的公网 HTTPS URL（如 `https://teapot-phone-agent.<subdomain>.workers.dev`，记为 `<WORKER_URL>`）。
 
 ### Step 2：编译并安装 Android App
 1. 编译 Debug APK：
@@ -81,10 +80,15 @@
 
 ### Step 5：端到端验收
 1. **公网心跳验收**：
-   ```bash
-   curl -sL "<WORKER_URL>/health"
-   ```
-   确认返回 `phone_online: true`、`direct_online: true`、`poll_waiters >= 1`、`phone.accessibility_enabled: true`。
+   - 匿名存活探测（仅返回基础标识）：
+     ```bash
+     curl -sL "<WORKER_URL>/health"
+     ```
+   - 鉴权诊断探测（由用户在本地终端执行，勿将密钥打印到对话日志）：
+     ```bash
+     curl -sL -H "Authorization: Bearer <PHONE_SECRET>" "<WORKER_URL>/health"
+     ```
+     确认返回 `phone_online: true`、`direct_online: true`、`poll_waiters >= 1`、`phone.accessibility_enabled: true`。
 2. **远程 MCP 接入（如 ChatGPT）**：
    - 在 ChatGPT 网页端 → Settings → Apps / Connectors → Create：
      - MCP URL：`<WORKER_URL>/mcp`
@@ -110,19 +114,18 @@ Verify locally:
 - `adb devices` shows target device as `device`
 - `npx wrangler whoami` (if unauthenticated, pause and ask the user to run `npx wrangler login`)
 
-### Step 1: Test & Deploy Cloudflare Worker Gateway
+### Step 1: Test & Deploy Cloudflare Worker Gateway (Free `*.workers.dev`, $0)
 1. Run Worker unit tests:
    ```bash
    node --test cloud/worker.test.cjs
    ```
-2. Create local config from template (git-ignored):
-   ```bash
-   cp cloud/wrangler.jsonc.example cloud/wrangler.jsonc
-   ```
-   Optionally configure custom `routes` if requested by the user.
+2. Choose config:
+   - **No custom domain (default, $0 Free Plan)**: Use the built-in `cloud/wrangler.jsonc` directly (`workers_dev: true` + SQLite Durable Object).
+   - **Custom domain (optional)**: Copy `cloud/wrangler.jsonc.example` to `cloud/wrangler.local.jsonc` (git-ignored) and add your `routes`.
 3. Deploy:
    ```bash
-   npx wrangler deploy -c cloud/wrangler.jsonc
+   cd cloud && npm install
+   npx wrangler deploy -c wrangler.jsonc
    ```
    Record the deployed HTTPS `<WORKER_URL>`.
 
@@ -157,5 +160,5 @@ Guide the user to:
 2. Tap **Start / Reconnect Service**.
 
 ### Step 5: End-to-End Verification
-1. Verify `<WORKER_URL>/health` returns `phone_online: true`, `direct_online: true`, `poll_waiters >= 1`.
+1. Verify anonymous `GET <WORKER_URL>/health` returns `{ "ok": true, "service": "teapot-phone-agent" }`, and authenticated `GET <WORKER_URL>/health` (with `Authorization: Bearer <PHONE_SECRET>`) returns `phone_online: true`, `direct_online: true`, `poll_waiters >= 1`.
 2. Connect ChatGPT (or any OAuth 2.0 + PKCE MCP client) to `<WORKER_URL>/mcp`, or mount `mcp-bridge/phone-mcp-stdio.mjs` locally with `PHONE_AGENT_TOKEN`.
