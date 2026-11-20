@@ -159,7 +159,7 @@ public final class BridgeService extends Service {
                 if ("initialize".equals(method)) {
                     String harnessInstructions = "你已接入 Teapot Phone-Agent 自主闭环执行框架 (Autonomous Phone Agent Harness)。\n"
                             + "【核心工作准则：能用指令不用副屏，能用副屏不用主屏，禁止无故抢占主屏】\n"
-                            + "0. 【系统指令直达最高优先】：定闹钟（`request_alarm`，已内置 Shizuku adb_shell 通道与 AlarmManager/dumpsys alarm 闭环核验）、日历、相册与文件读写等，直接调用对应原生工具，无需切屏也不要用 `termux_run` 执行 `am` 系统命令。\n"
+                            + "0. 【系统指令直达最高优先】：闹钟管理（`request_alarm` / `list_alarms` / `dismiss_alarm`）、倒计时（`set_timer`）、设备状态（`device_status`）、音量与静音（`set_volume`）、媒体播放控制（`media_control`）、日历、相册与文件读写等，直接调用对应原生工具；其他受控原生命令可走 `shizuku_native_cmd`（需用户在手机端安全开关启用，白名单 `am`/`dumpsys`/`cmd`/`pm`/`wm`/`media`），无需切屏也不要用 `termux_run` 跑系统 `am` 命令。\n"
                             + "1. 【离屏副屏操作普通 App】：当原生指令无法覆盖、需要操作普通 App（如 QQ、浏览器等）时，禁止直接用主屏 open_app 或只看通知栏就放弃！请优先走离屏虚拟屏链路：\n"
                             + "   - 先调用 `virtual_display_create` 创建隐形离屏虚拟屏（拿到 `display_id`）；\n"
                             + "   - 调用 `open_app_on_display(app, display_id)` 在副屏启动目标 App；\n"
@@ -198,6 +198,35 @@ public final class BridgeService extends Service {
                                     .put("minute", field("integer", "分钟 0-59"))
                                     .put("label", field("string", "闹钟名称")))
                             .put("required", new JSONArray().put("hour").put("minute"));
+                    JSONObject dismissAlarmSchema = new JSONObject().put("type", "object")
+                            .put("properties", new JSONObject()
+                                    .put("search_mode", field("string", "匹配模式：label（按标签）/ time（按时间）/ next（最近一个）/ all（全部）；省略时自动按已传参数推断"))
+                                    .put("label", field("string", "要取消的闹钟标签（search_mode=label 时必填）"))
+                                    .put("hour", field("integer", "小时 0-23（search_mode=time 时必填）"))
+                                    .put("minute", field("integer", "分钟 0-59（search_mode=time 时必填）"))
+                                    .put("skip_ui", field("boolean", "是否跳过时钟界面，默认 true")));
+                    JSONObject timerSchema = new JSONObject().put("type", "object")
+                            .put("properties", new JSONObject()
+                                    .put("seconds", field("integer", "倒计时秒数（1-86400）"))
+                                    .put("label", field("string", "可选：倒计时名称"))
+                                    .put("skip_ui", field("boolean", "是否跳过时钟界面直接开始，默认 true")))
+                            .put("required", new JSONArray().put("seconds"));
+                    JSONObject volumeSchema = new JSONObject().put("type", "object")
+                            .put("properties", new JSONObject()
+                                    .put("stream", field("string", "音量通道：music（媒体）/ ring（铃声）/ alarm（闹钟）/ notification（通知）/ call（通话）"))
+                                    .put("percent", field("integer", "目标音量百分比 0-100（传入 stream 或 percent 时必填）"))
+                                    .put("ringer_mode", field("string", "可选：响铃模式 normal（响铃）/ vibrate（震动）/ silent（静音）")));
+                    JSONObject mediaSchema = new JSONObject().put("type", "object")
+                            .put("properties", new JSONObject()
+                                    .put("action", field("string", "媒体控制动作：play / pause / play_pause / next / previous / stop")))
+                            .put("required", new JSONArray().put("action"));
+                    JSONObject nativeCmdSchema = new JSONObject().put("type", "object")
+                            .put("properties", new JSONObject()
+                                    .put("command", field("string", "白名单主命令：am / dumpsys / cmd / pm / wm / media"))
+                                    .put("args", new JSONObject().put("type", "array")
+                                            .put("items", new JSONObject().put("type", "string"))
+                                            .put("description", "参数字符串数组（直传 execve，不经 shell；硬禁提权、装卸、清除数据与受保护系统包）")))
+                            .put("required", new JSONArray().put("command").put("args"));
                     JSONObject listAppsSchema = new JSONObject().put("type", "object")
                             .put("properties", new JSONObject().put("query", field("string", "可选：应用中文名或包名搜索关键字，如 '微信'、'美团'、'时钟'")));
                     JSONObject openAppSchema = new JSONObject().put("type", "object")
@@ -362,6 +391,13 @@ public final class BridgeService extends Service {
                             .put(tool("fs_unzip", "预览或解压 .zip 压缩包到指定目录（带路径穿越安全校验）", fsUnzipSchema))
                             .put(tool("open_file_on_phone", "在手机屏幕上调用系统应用直接打开指定文件，并自动返回打开后的屏幕状态快照", fsPathSchema))
                             .put(tool("request_alarm", "优先通过 Shizuku (adb_shell) 直接执行原生 am start (SET_ALARM + SKIP_UI=true) 设置手机系统闹钟（不打扰主屏），并结合 AlarmManager 与 dumpsys alarm 自动闭环核验真实生效状态", alarmSchema))
+                            .put(tool("list_alarms", "只读列出手机当前所有系统闹钟（含 AlarmManager 最近项与 Shizuku dumpsys alarm 真实响铃明细，0 切屏）", schema))
+                            .put(tool("dismiss_alarm", "优先通过 Shizuku 原生执行 ACTION_DISMISS_ALARM 按标签/时间取消或关闭闹钟，并结合 dumpsys alarm 前后对比核验", dismissAlarmSchema))
+                            .put(tool("set_timer", "优先通过 Shizuku 原生执行 ACTION_SET_TIMER 直接启动系统倒计时（不打扰主屏）", timerSchema))
+                            .put(tool("device_status", "只读查询手机实时设备状态：电量与充电状态、亮屏/锁屏、各通道音量与响铃模式、媒体播放状态、网络与本地时间（0 切屏）", schema))
+                            .put(tool("set_volume", "原生调节手机各通道音量（0-100%）或切换响铃/震动/静音模式，并即时回读核验（0 切屏）", volumeSchema))
+                            .put(tool("media_control", "原生发送媒体播放控制指令（play / pause / play_pause / next / previous / stop），不切屏直接控制音乐/播客", mediaSchema))
+                            .put(tool("shizuku_native_cmd", "受控白名单 Shizuku 原生命令通道（默认关闭需手机端安全开关开启；仅放行 am/dumpsys/cmd/pm只读/wm只读/media，argv 直传无 shell 注入，硬禁提权与受保护包）", nativeCmdSchema))
                             .put(tool("list_installed_apps", "列出或搜索手机上已安装的应用名称与包名", listAppsSchema))
                             .put(tool("open_app", "按应用名称（如'微信'、'浏览器'、'时钟'、'相册'）或包名直接启动应用，等待加载后自动返回新页面快照", openAppSchema))
                             .put(tool("request_screen_control", "请求开启或续期临时屏幕控制会话（默认需手机本机人工确认；若在设置中开启自动续期则自动激活）并返回当前屏幕快照", schema))
@@ -429,6 +465,61 @@ public final class BridgeService extends Service {
                         JSONObject verify = new SystemTools(BridgeService.this).setAlarmAndVerify(hour, minute, label);
                         result = textResult(verify.toString(), !verify.optBoolean("ok", false));
                     } catch (Exception e) { result = textResult("设置闹钟失败：" + e.getMessage(), true); }
+                } else if ("tools/call".equals(method) && "list_alarms".equals(req.getJSONObject("params").getString("name"))) {
+                    try {
+                        result = textResult(new SystemTools(BridgeService.this).listAlarms().toString(), false);
+                    } catch (Exception e) { result = classifiedErrorResult("list_alarms", e); }
+                } else if ("tools/call".equals(method) && "dismiss_alarm".equals(req.getJSONObject("params").getString("name"))) {
+                    try {
+                        JSONObject a = req.getJSONObject("params").optJSONObject("arguments");
+                        if (a == null) a = new JSONObject();
+                        JSONObject resObj = new SystemTools(BridgeService.this).dismissAlarmAndVerify(
+                                a.optString("search_mode", ""),
+                                a.optString("label", ""),
+                                a.optInt("hour", -1),
+                                a.optInt("minute", -1),
+                                a.optBoolean("skip_ui", true));
+                        result = textResult(resObj.toString(), !resObj.optBoolean("ok", false));
+                    } catch (Exception e) { result = classifiedErrorResult("dismiss_alarm", e); }
+                } else if ("tools/call".equals(method) && "set_timer".equals(req.getJSONObject("params").getString("name"))) {
+                    try {
+                        JSONObject a = req.getJSONObject("params").getJSONObject("arguments");
+                        JSONObject resObj = new SystemTools(BridgeService.this).setTimer(
+                                a.getInt("seconds"),
+                                a.optString("label", ""),
+                                a.optBoolean("skip_ui", true));
+                        result = textResult(resObj.toString(), !resObj.optBoolean("ok", false));
+                    } catch (Exception e) { result = classifiedErrorResult("set_timer", e); }
+                } else if ("tools/call".equals(method) && "device_status".equals(req.getJSONObject("params").getString("name"))) {
+                    try {
+                        result = textResult(new SystemTools(BridgeService.this).deviceStatus().toString(), false);
+                    } catch (Exception e) { result = classifiedErrorResult("device_status", e); }
+                } else if ("tools/call".equals(method) && "set_volume".equals(req.getJSONObject("params").getString("name"))) {
+                    try {
+                        JSONObject a = req.getJSONObject("params").optJSONObject("arguments");
+                        if (a == null) a = new JSONObject();
+                        JSONObject resObj = new SystemTools(BridgeService.this).setVolume(
+                                a.optString("stream", ""),
+                                a.has("percent") ? a.getInt("percent") : -1,
+                                a.optString("ringer_mode", ""));
+                        result = textResult(resObj.toString(), !resObj.optBoolean("ok", false));
+                    } catch (Exception e) { result = classifiedErrorResult("set_volume", e); }
+                } else if ("tools/call".equals(method) && "media_control".equals(req.getJSONObject("params").getString("name"))) {
+                    try {
+                        JSONObject a = req.getJSONObject("params").getJSONObject("arguments");
+                        JSONObject resObj = new SystemTools(BridgeService.this).mediaControl(a.getString("action"));
+                        result = textResult(resObj.toString(), !resObj.optBoolean("ok", false));
+                    } catch (Exception e) { result = classifiedErrorResult("media_control", e); }
+                } else if ("tools/call".equals(method) && "shizuku_native_cmd".equals(req.getJSONObject("params").getString("name"))) {
+                    try {
+                        JSONObject a = req.getJSONObject("params").getJSONObject("arguments");
+                        String cmd = a.getString("command");
+                        JSONArray arr = a.getJSONArray("args");
+                        java.util.List<String> argList = new java.util.ArrayList<>();
+                        for (int i = 0; i < arr.length(); i++) argList.add(arr.getString(i));
+                        JSONObject resObj = ShizukuBridge.runWhitelistedNativeCmd(BridgeService.this, cmd, argList);
+                        result = textResult(resObj.toString(), !resObj.optBoolean("ok", false));
+                    } catch (Exception e) { result = classifiedErrorResult("shizuku_native_cmd", e); }
                 } else if ("tools/call".equals(method) && "list_installed_apps".equals(req.getJSONObject("params").getString("name"))) {
                     try {
                         JSONObject a = req.getJSONObject("params").optJSONObject("arguments");
@@ -803,8 +894,8 @@ public final class BridgeService extends Service {
             }
         }
         private JSONObject tool(String name, String description, JSONObject schema) throws org.json.JSONException {
-            boolean readOnly = java.util.Arrays.asList("list_calendars", "list_calendar_events", "list_file_roots", "list_root_files", "read_text_file", "album_summary", "fs_list_dir", "fs_search", "fs_read_text_path", "screen_observe", "phone_health", "list_displays", "shizuku_status", "termux_status", "termux_logs").contains(name);
-            boolean destructive = java.util.Arrays.asList("fs_delete", "fs_move", "fs_copy", "fs_write_text_path", "fs_zip", "fs_unzip", "screen_click_text", "screen_tap", "screen_swipe", "screen_set_text", "screen_back", "open_app", "open_app_on_display", "open_file_on_phone", "create_calendar_event", "request_alarm", "virtual_display_destroy", "termux_run", "termux_stop").contains(name);
+            boolean readOnly = java.util.Arrays.asList("list_calendars", "list_calendar_events", "list_file_roots", "list_root_files", "read_text_file", "album_summary", "fs_list_dir", "fs_search", "fs_read_text_path", "screen_observe", "phone_health", "list_displays", "shizuku_status", "termux_status", "termux_logs", "list_alarms", "device_status").contains(name);
+            boolean destructive = java.util.Arrays.asList("fs_delete", "fs_move", "fs_copy", "fs_write_text_path", "fs_zip", "fs_unzip", "screen_click_text", "screen_tap", "screen_swipe", "screen_set_text", "screen_back", "open_app", "open_app_on_display", "open_file_on_phone", "create_calendar_event", "request_alarm", "dismiss_alarm", "set_timer", "set_volume", "media_control", "shizuku_native_cmd", "virtual_display_destroy", "termux_run", "termux_stop").contains(name);
             JSONObject annotations = new JSONObject()
                     .put("readOnlyHint", readOnly)
                     .put("destructiveHint", destructive)

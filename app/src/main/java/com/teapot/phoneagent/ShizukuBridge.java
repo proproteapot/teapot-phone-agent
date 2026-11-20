@@ -33,6 +33,26 @@ final class ShizukuBridge {
     private static final int SHIZUKU_PERMISSION_CODE = 1001;
     private static final String PREFS = "shizuku_bridge_prefs";
     private static final String KEY_AUTO_RESTORE_A11Y = "auto_restore_a11y";
+    private static final String KEY_NATIVE_CMD_ENABLED = "native_cmd_enabled";
+    private static final int MAX_NATIVE_CMD_OUTPUT_CHARS = 16384;
+    private static final java.util.Set<String> SAFE_DUMPSYS_SERVICES = new java.util.HashSet<>(java.util.Arrays.asList(
+            "alarm", "battery", "audio", "media_session", "notification", "window", "display",
+            "activity", "connectivity", "wifi", "power", "package", "statusbar", "input_method",
+            "bluetooth_manager", "telecom", "location", "sensorservice"
+    ));
+    private static final java.util.Set<String> SAFE_AM_SUBCOMMANDS = new java.util.HashSet<>(java.util.Arrays.asList(
+            "start", "broadcast", "force-stop", "get-current-user", "get-config", "to-uri", "to-intent-uri"
+    ));
+    private static final java.util.Set<String> SAFE_PM_SUBCOMMANDS = new java.util.HashSet<>(java.util.Arrays.asList(
+            "list", "path", "resolve-activity", "dump"
+    ));
+    private static final java.util.Set<String> SAFE_CMD_SERVICES = new java.util.HashSet<>(java.util.Arrays.asList(
+            "media_session", "statusbar", "notification", "alarm", "audio", "connectivity",
+            "wifi", "bluetooth_manager", "telecom", "power", "activity", "package"
+    ));
+    private static final java.util.Set<String> FORBIDDEN_FORCE_STOP_PKGS = new java.util.HashSet<>(java.util.Arrays.asList(
+            "android", "com.android.systemui", "com.android.settings", "com.miui.home", "com.android.launcher"
+    ));
     private static final String A11Y_COMPONENT = "com.teapot.phoneagent/com.teapot.phoneagent.ScreenControlService";
     private static volatile boolean initialized;
     private static volatile Context appContext;
@@ -523,6 +543,372 @@ final class ShizukuBridge {
             clean = " " + clean;
         }
         return clean;
+    }
+
+    static boolean isNativeCmdEnabled(Context context) {
+        Context ctx = context != null ? context.getApplicationContext() : appContext;
+        if (ctx == null) return false;
+        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getBoolean(KEY_NATIVE_CMD_ENABLED, false);
+    }
+
+    static void setNativeCmdEnabled(Context context, boolean enabled) {
+        Context ctx = context != null ? context.getApplicationContext() : appContext;
+        if (ctx == null) return;
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_NATIVE_CMD_ENABLED, enabled).commit();
+    }
+
+    /** 通过 Shizuku (adb_shell) 原生执行 ACTION_DISMISS_ALARM */
+    static JSONObject dismissAlarmViaShell(String searchMode, String label, int hour, int minute,
+                                           boolean skipUi, String targetPackage) throws Exception {
+        ensurePrivilegedReady();
+        String cleanPkg = validateOptionalTargetPackage(targetPackage);
+        String normalizedMode = normalizeDismissSearchMode(searchMode, label, hour, minute);
+        String cleanLabel = sanitizeAlarmLabel(label);
+
+        List<String> cmd = new ArrayList<>();
+        cmd.add("am");
+        cmd.add("start");
+        cmd.add("-a");
+        cmd.add("android.intent.action.DISMISS_ALARM");
+        cmd.add("--es");
+        cmd.add("android.intent.extra.alarm.SEARCH_MODE");
+        cmd.add(normalizedMode);
+        if ("android.label".equals(normalizedMode)) {
+            if (cleanLabel.isEmpty()) throw new IllegalArgumentException("按标签取消闹钟时必须提供 label");
+            cmd.add("--es");
+            cmd.add("android.intent.extra.alarm.MESSAGE");
+            cmd.add(cleanLabel);
+        } else if ("android.time".equals(normalizedMode)) {
+            if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+                throw new IllegalArgumentException("按时间取消闹钟时必须提供合法的 hour (0-23) 与 minute (0-59)");
+            }
+            cmd.add("--ei");
+            cmd.add("android.intent.extra.alarm.HOUR");
+            cmd.add(String.valueOf(hour));
+            cmd.add("--ei");
+            cmd.add("android.intent.extra.alarm.MINUTES");
+            cmd.add(String.valueOf(minute));
+            if (!cleanLabel.isEmpty()) {
+                cmd.add("--es");
+                cmd.add("android.intent.extra.alarm.MESSAGE");
+                cmd.add(cleanLabel);
+            }
+        }
+        cmd.add("--ez");
+        cmd.add("android.intent.extra.alarm.SKIP_UI");
+        cmd.add(skipUi ? "true" : "false");
+        if (!cleanPkg.isEmpty()) {
+            cmd.add("-p");
+            cmd.add(cleanPkg);
+        }
+
+        String amOut = runPrivilegedCmd(cmd.toArray(new String[0])).trim();
+        String lower = amOut.toLowerCase(Locale.ROOT);
+        boolean hasError = lower.contains("error:")
+                || lower.contains("exception")
+                || lower.contains("unable to resolve")
+                || lower.contains("permission denial");
+
+        return new JSONObject()
+                .put("ok", !hasError)
+                .put("search_mode", normalizedMode)
+                .put("target_package", cleanPkg)
+                .put("am_output", amOut);
+    }
+
+    /** 通过 Shizuku (adb_shell) 原生执行 ACTION_SET_TIMER 设置倒计时 */
+    static JSONObject setTimerViaShell(int seconds, String label, boolean skipUi, String targetPackage) throws Exception {
+        ensurePrivilegedReady();
+        if (seconds < 1 || seconds > 86400) {
+            throw new IllegalArgumentException("倒计时秒数必须在 1 到 86400 之间");
+        }
+        String cleanPkg = validateOptionalTargetPackage(targetPackage);
+        String cleanLabel = sanitizeAlarmLabel(label);
+
+        List<String> cmd = new ArrayList<>();
+        cmd.add("am");
+        cmd.add("start");
+        cmd.add("-a");
+        cmd.add("android.intent.action.SET_TIMER");
+        cmd.add("--ei");
+        cmd.add("android.intent.extra.alarm.LENGTH");
+        cmd.add(String.valueOf(seconds));
+        cmd.add("--ez");
+        cmd.add("android.intent.extra.alarm.SKIP_UI");
+        cmd.add(skipUi ? "true" : "false");
+        if (!cleanLabel.isEmpty()) {
+            cmd.add("--es");
+            cmd.add("android.intent.extra.alarm.MESSAGE");
+            cmd.add(cleanLabel);
+        }
+        if (!cleanPkg.isEmpty()) {
+            cmd.add("-p");
+            cmd.add(cleanPkg);
+        }
+
+        String amOut = runPrivilegedCmd(cmd.toArray(new String[0])).trim();
+        String lower = amOut.toLowerCase(Locale.ROOT);
+        boolean hasError = lower.contains("error:")
+                || lower.contains("exception")
+                || lower.contains("unable to resolve")
+                || lower.contains("permission denial");
+
+        return new JSONObject()
+                .put("ok", !hasError)
+                .put("seconds", seconds)
+                .put("target_package", cleanPkg)
+                .put("am_output", amOut);
+    }
+
+    /** 只读列出 dumpsys alarm 中的所有系统闹钟条目（结构化，区分真实响铃与 HyperOS 提前提醒） */
+    static JSONObject listAlarmsViaDump() {
+        JSONObject out = new JSONObject();
+        JSONArray realAlarms = new JSONArray();
+        JSONArray preAlerts = new JSONArray();
+        try {
+            if (!isAuthorized()) {
+                return out.put("available", false);
+            }
+            String dump = runPrivilegedCmd("dumpsys", "alarm");
+            String currentTag = "";
+            String currentPkg = "";
+            boolean inAlarmClockBlock = false;
+            String[] lines = dump.split("\n");
+            for (String raw : lines) {
+                String line = raw.trim();
+                if (line.isEmpty()) continue;
+
+                if (line.contains("Alarm{") && (line.startsWith("RTC") || line.startsWith("ELAPSED"))) {
+                    currentTag = "";
+                    currentPkg = "";
+                    inAlarmClockBlock = false;
+                    int lastSpace = line.lastIndexOf(' ');
+                    int endBrace = line.lastIndexOf('}');
+                    if (lastSpace > 0 && endBrace > lastSpace) {
+                        currentPkg = line.substring(lastSpace + 1, endBrace).trim();
+                    }
+                    continue;
+                }
+                if (line.startsWith("tag=")) {
+                    currentTag = line.substring(4).trim();
+                    continue;
+                }
+                if (line.equals("Alarm clock:")) {
+                    inAlarmClockBlock = true;
+                    continue;
+                }
+                if (inAlarmClockBlock && line.startsWith("triggerTime=")) {
+                    String triggerVal = line.substring("triggerTime=".length()).trim();
+                    boolean isPreAlert = currentTag.contains("ALARM_ARRIVING");
+                    JSONObject item = new JSONObject()
+                            .put("package", currentPkg)
+                            .put("tag", currentTag)
+                            .put("trigger_time", triggerVal)
+                            .put("is_pre_alert", isPreAlert);
+                    if (isPreAlert) {
+                        if (preAlerts.length() < 15) preAlerts.put(item);
+                    } else {
+                        if (realAlarms.length() < 20) realAlarms.put(item);
+                    }
+                    inAlarmClockBlock = false;
+                    continue;
+                }
+                if (inAlarmClockBlock && !raw.startsWith("        ")) {
+                    inAlarmClockBlock = false;
+                }
+            }
+            out.put("available", true)
+                    .put("alarm_count", realAlarms.length())
+                    .put("alarms", realAlarms)
+                    .put("pre_alerts", preAlerts);
+        } catch (Exception e) {
+            try {
+                out.put("available", false).put("error", e.getMessage());
+            } catch (Exception ignored) { }
+        }
+        return out;
+    }
+
+    /** 通过 Shizuku 执行 cmd media_session dispatch <action> 控制媒体播放 */
+    static JSONObject dispatchMediaViaShell(String action) throws Exception {
+        ensurePrivilegedReady();
+        String key = action == null ? "" : action.trim().toLowerCase(Locale.ROOT);
+        String mapped;
+        switch (key) {
+            case "play": mapped = "play"; break;
+            case "pause": mapped = "pause"; break;
+            case "play_pause": mapped = "play-pause"; break;
+            case "next": mapped = "next"; break;
+            case "previous": mapped = "previous"; break;
+            case "stop": mapped = "stop"; break;
+            default: throw new IllegalArgumentException("不支持的媒体控制动作：" + action);
+        }
+        String out = runPrivilegedCmd("cmd", "media_session", "dispatch", mapped).trim();
+        return new JSONObject()
+                .put("ok", !out.toLowerCase(Locale.ROOT).contains("error"))
+                .put("action", mapped)
+                .put("output", out);
+    }
+
+    /**
+     * 受控白名单原生命令通道（直传 argv[] 给 execve，不经 /bin/sh，默认关闭需手机端手动开启）：
+     * 放行日常高频 Android 原生命令族（am/dumpsys/cmd/pm 只读/wm 只读/media），
+     * 硬拦截提权、装卸应用、清除数据、修改系统安全设置及受保护包名。
+     */
+    static JSONObject runWhitelistedNativeCmd(Context context, String command, List<String> args) throws Exception {
+        if (!isNativeCmdEnabled(context)) {
+            throw new SecurityException("受控原生命令通道默认关闭；如需使用，请在手机端「设置与权限管理 → 安全开关」中手动开启");
+        }
+        ensurePrivilegedReady();
+        String bin = command == null ? "" : command.trim().toLowerCase(Locale.ROOT);
+        List<String> safeArgs = new ArrayList<>();
+        if (args != null) {
+            if (args.size() > 24) throw new IllegalArgumentException("参数数量超过上限（最多 24 项）");
+            for (String a : args) {
+                if (a == null) continue;
+                if (a.length() > 512) throw new IllegalArgumentException("单个参数长度超过 512 字符上限");
+                for (int i = 0; i < a.length(); i++) {
+                    char c = a.charAt(i);
+                    if (c < 0x20 || c == 0x7F) {
+                        throw new IllegalArgumentException("参数包含非法控制字符");
+                    }
+                }
+                checkNotProtectedArg(a);
+                safeArgs.add(a);
+            }
+        }
+
+        validateNativeCommandPolicy(bin, safeArgs);
+
+        List<String> argv = new ArrayList<>();
+        argv.add(bin);
+        argv.addAll(safeArgs);
+
+        String rawOut = runPrivilegedCmd(argv.toArray(new String[0]));
+        boolean truncated = rawOut.length() > MAX_NATIVE_CMD_OUTPUT_CHARS;
+        String outText = truncated ? rawOut.substring(0, MAX_NATIVE_CMD_OUTPUT_CHARS) + "\n...[truncated]" : rawOut;
+        String lower = outText.toLowerCase(Locale.ROOT);
+        boolean hasError = lower.contains("securityexception")
+                || lower.contains("permission denial")
+                || lower.contains("error:")
+                || lower.contains("unknown command");
+
+        return new JSONObject()
+                .put("ok", !hasError)
+                .put("command", bin)
+                .put("args", new JSONArray(safeArgs))
+                .put("truncated", truncated)
+                .put("output", outText.trim());
+    }
+
+    private static void validateNativeCommandPolicy(String bin, List<String> args) {
+        if (args.isEmpty()) {
+            throw new IllegalArgumentException("必须提供子命令参数 args");
+        }
+        String sub = args.get(0).trim().toLowerCase(Locale.ROOT);
+        switch (bin) {
+            case "am":
+                if (!SAFE_AM_SUBCOMMANDS.contains(sub)) {
+                    throw new SecurityException("安全限制：am 仅允许子命令 " + SAFE_AM_SUBCOMMANDS + "，禁止 " + sub);
+                }
+                if ("force-stop".equals(sub)) {
+                    if (args.size() != 2) throw new IllegalArgumentException("am force-stop 需要且仅需 1 个目标包名");
+                    String target = args.get(1).trim().toLowerCase(Locale.ROOT);
+                    if (FORBIDDEN_FORCE_STOP_PKGS.contains(target)) {
+                        throw new SecurityException("安全保护：禁止停止系统核心进程 " + target);
+                    }
+                }
+                break;
+            case "dumpsys":
+                if (!SAFE_DUMPSYS_SERVICES.contains(sub)) {
+                    throw new SecurityException("安全限制：dumpsys 仅允许诊断白名单服务 " + SAFE_DUMPSYS_SERVICES);
+                }
+                break;
+            case "pm":
+                if (!SAFE_PM_SUBCOMMANDS.contains(sub)) {
+                    throw new SecurityException("安全限制：pm 仅允许只读查询子命令 " + SAFE_PM_SUBCOMMANDS + "（禁止 grant/revoke/install/uninstall/clear/disable）");
+                }
+                break;
+            case "wm":
+                if ((!"size".equals(sub) && !"density".equals(sub)) || args.size() != 1) {
+                    throw new SecurityException("安全限制：wm 仅允许只读查询 size 或 density");
+                }
+                break;
+            case "media":
+                if (!"dispatch".equals(sub) && !"volume".equals(sub)) {
+                    throw new SecurityException("安全限制：media 仅允许 dispatch 或 volume");
+                }
+                break;
+            case "cmd":
+                if (!SAFE_CMD_SERVICES.contains(sub)) {
+                    throw new SecurityException("安全限制：cmd 仅允许白名单服务 " + SAFE_CMD_SERVICES);
+                }
+                String subAction = args.size() >= 2 ? args.get(1).trim().toLowerCase(Locale.ROOT) : "";
+                if ("package".equals(sub) && !SAFE_PM_SUBCOMMANDS.contains(subAction)) {
+                    throw new SecurityException("安全限制：cmd package 仅允许只读查询 " + SAFE_PM_SUBCOMMANDS);
+                }
+                if ("activity".equals(sub) && !java.util.Arrays.asList("get-current-user", "get-config").contains(subAction)) {
+                    throw new SecurityException("安全限制：cmd activity 仅允许 get-current-user / get-config");
+                }
+                if ("power".equals(sub) && (subAction.contains("reboot") || subAction.contains("shutdown"))) {
+                    throw new SecurityException("安全限制：禁止通过 cmd power 执行重启或关机");
+                }
+                break;
+            default:
+                throw new SecurityException("安全限制：仅允许白名单主命令 am / dumpsys / cmd / pm / wm / media（不支持 " + bin + "）");
+        }
+    }
+
+    private static void checkNotProtectedArg(String arg) {
+        String lower = arg.trim().toLowerCase(Locale.ROOT);
+        if (lower.isEmpty()) return;
+        String pkgCandidate = lower;
+        int slash = pkgCandidate.indexOf('/');
+        if (slash > 0) pkgCandidate = pkgCandidate.substring(0, slash);
+        if (pkgCandidate.startsWith("package:")) pkgCandidate = pkgCandidate.substring("package:".length());
+        if (ScreenControlService.isProtectedPackage(pkgCandidate) || ScreenControlService.isProtectedPackage(lower)) {
+            throw new SecurityException("安全保护：禁止通过原生命令操作受保护系统包或本应用（" + arg + "）");
+        }
+    }
+
+    private static String validateOptionalTargetPackage(String targetPackage) {
+        String cleanPkg = targetPackage == null ? "" : targetPackage.trim();
+        if (!cleanPkg.isEmpty()) {
+            if (!cleanPkg.matches("[a-zA-Z0-9._]+")) {
+                throw new IllegalArgumentException("非法包名: " + cleanPkg);
+            }
+            if (ScreenControlService.isProtectedPackage(cleanPkg)) {
+                throw new SecurityException("安全保护：禁止通过 Shizuku 启动受保护系统包（" + cleanPkg + "）");
+            }
+        }
+        return cleanPkg;
+    }
+
+    private static String normalizeDismissSearchMode(String searchMode, String label, int hour, int minute) {
+        String raw = searchMode == null ? "" : searchMode.trim().toLowerCase(Locale.ROOT);
+        if (raw.isEmpty()) {
+            if (label != null && !label.trim().isEmpty()) return "android.label";
+            if (hour >= 0 && minute >= 0) return "android.time";
+            return "android.next";
+        }
+        switch (raw) {
+            case "label":
+            case "android.label":
+                return "android.label";
+            case "time":
+            case "android.time":
+                return "android.time";
+            case "next":
+            case "android.next":
+                return "android.next";
+            case "all":
+            case "android.all":
+                return "android.all";
+            default:
+                throw new IllegalArgumentException("不支持的 search_mode：" + searchMode + "（可选 label / time / next / all）");
+        }
     }
 
     static boolean inputTapOnDisplay(int displayId, int x, int y) {

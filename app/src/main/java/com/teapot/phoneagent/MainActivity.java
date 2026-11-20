@@ -27,6 +27,7 @@ public final class MainActivity extends Activity {
     private Button autoApproveBtn;
     private Button termuxExecBtn;
     private Button autoRestoreA11yBtn;
+    private Button nativeCmdBtn;
     private LinearLayout settingsPanel;
     private Button toggleSettingsBtn;
 
@@ -227,6 +228,14 @@ public final class MainActivity extends Activity {
         });
         settingsPanel.addView(autoRestoreA11yBtn);
 
+        nativeCmdBtn = new Button(this);
+        nativeCmdBtn.setOnClickListener(v -> {
+            boolean next = !ShizukuBridge.isNativeCmdEnabled(this);
+            ShizukuBridge.setNativeCmdEnabled(this, next);
+            refresh();
+        });
+        settingsPanel.addView(nativeCmdBtn);
+
         TextView advHeader = new TextView(this);
         advHeader.setText("── 公网网关与安全设置 ──");
         advHeader.setTextSize(14);
@@ -375,6 +384,7 @@ public final class MainActivity extends Activity {
         boolean termuxEnabled = TermuxCommandManager.isExecutionEnabled(this);
         boolean autoApprove = ScreenApprovalActivity.isAutoApproveEnabled(this);
         boolean autoRestoreA11y = ShizukuBridge.isAutoRestoreA11yEnabled(this);
+        boolean nativeCmdEnabled = ShizukuBridge.isNativeCmdEnabled(this);
         boolean controlling = ScreenApprovalActivity.allowed();
         boolean hasPending = ScreenApprovalActivity.pendingRequest != null && !controlling;
 
@@ -387,6 +397,7 @@ public final class MainActivity extends Activity {
         if (autoApproveBtn != null) autoApproveBtn.setText("屏幕控制免确认自动续期：" + (autoApprove ? "已开启" : "关闭（推荐：每次本机确认）"));
         if (termuxExecBtn != null) termuxExecBtn.setText("允许后台 Termux 命令执行：" + (termuxEnabled ? "已开启" : "关闭（默认）"));
         if (autoRestoreA11yBtn != null) autoRestoreA11yBtn.setText("Shizuku 自动恢复被误杀的无障碍：" + (autoRestoreA11y ? "已开启" : "关闭（默认）"));
+        if (nativeCmdBtn != null) nativeCmdBtn.setText("允许 Shizuku 白名单原生命令：" + (nativeCmdEnabled ? "已开启" : "关闭（默认）"));
 
         String controlState = controlling
                 ? "进行中（剩余 " + Math.max(0, (ScreenApprovalActivity.expiresAt - android.os.SystemClock.elapsedRealtime() + 999) / 1000) + " 秒）"

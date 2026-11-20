@@ -979,6 +979,371 @@ final class SystemTools {
         }
     }
 
+    /** 只读查询系统当前所有闹钟（AlarmManager + Shizuku dumpsys alarm） */
+    JSONObject listAlarms() throws Exception {
+        android.app.AlarmManager am = context.getSystemService(android.app.AlarmManager.class);
+        long nextMs = getNextAlarmTriggerMs(am);
+        String nextFmt = nextMs > 0
+                ? new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA).format(new java.util.Date(nextMs))
+                : "无";
+        JSONObject dump = ShizukuBridge.listAlarmsViaDump();
+        JSONObject out = new JSONObject()
+                .put("ok", true)
+                .put("system_has_active_alarm", nextMs > 0)
+                .put("next_alarm_trigger_ms", nextMs)
+                .put("next_alarm_formatted", nextFmt)
+                .put("shizuku_authorized", ShizukuBridge.isAuthorized());
+        if (dump.optBoolean("available", false)) {
+            out.put("alarm_count", dump.optInt("alarm_count", 0))
+                    .put("alarms", dump.optJSONArray("alarms"))
+                    .put("pre_alerts", dump.optJSONArray("pre_alerts"));
+        } else {
+            out.put("note", "Shizuku 未授权，当前仅返回 AlarmManager 最近一项；授权 Shizuku 后可列出完整系统闹钟明细。");
+        }
+        return out;
+    }
+
+    /** 原生取消/关闭闹钟（优先 Shizuku am start DISMISS_ALARM + dumpsys alarm 前后对比核验） */
+    JSONObject dismissAlarmAndVerify(String searchMode, String label, int hour, int minute, boolean skipUi) throws Exception {
+        android.app.AlarmManager am = context.getSystemService(android.app.AlarmManager.class);
+        long beforeNext = getNextAlarmTriggerMs(am);
+        JSONObject beforeDump = ShizukuBridge.isAuthorized() ? ShizukuBridge.listAlarmsViaDump() : null;
+        int beforeCount = beforeDump != null ? beforeDump.optInt("alarm_count", -1) : -1;
+
+        Intent probeIntent = new Intent(AlarmClock.ACTION_DISMISS_ALARM);
+        String preferredPkg = resolvePreferredAlarmPackage(probeIntent);
+        boolean shizukuAuth = ShizukuBridge.isAuthorized();
+        String channel = "app_intent";
+        boolean dispatchOk = false;
+        String amOutput = "";
+        String dispatchError = "";
+        String usedMode = searchMode == null ? "" : searchMode;
+
+        if (shizukuAuth) {
+            try {
+                JSONObject res = ShizukuBridge.dismissAlarmViaShell(searchMode, label, hour, minute, skipUi, preferredPkg);
+                channel = "shizuku_am_start";
+                dispatchOk = res.optBoolean("ok", false);
+                amOutput = res.optString("am_output", "");
+                usedMode = res.optString("search_mode", usedMode);
+            } catch (Exception e) {
+                dispatchError = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            }
+        }
+
+        if (!dispatchOk) {
+            try {
+                Intent dismiss = new Intent(AlarmClock.ACTION_DISMISS_ALARM)
+                        .putExtra(AlarmClock.EXTRA_SKIP_UI, skipUi)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
+                String normMode = (label != null && !label.trim().isEmpty() && (searchMode == null || searchMode.trim().isEmpty()))
+                        ? AlarmClock.ALARM_SEARCH_MODE_LABEL
+                        : (hour >= 0 && minute >= 0 && (searchMode == null || searchMode.trim().isEmpty())
+                        ? AlarmClock.ALARM_SEARCH_MODE_TIME
+                        : ("label".equalsIgnoreCase(searchMode) || AlarmClock.ALARM_SEARCH_MODE_LABEL.equalsIgnoreCase(searchMode)
+                        ? AlarmClock.ALARM_SEARCH_MODE_LABEL
+                        : ("time".equalsIgnoreCase(searchMode) || AlarmClock.ALARM_SEARCH_MODE_TIME.equalsIgnoreCase(searchMode)
+                        ? AlarmClock.ALARM_SEARCH_MODE_TIME
+                        : ("all".equalsIgnoreCase(searchMode) || AlarmClock.ALARM_SEARCH_MODE_ALL.equalsIgnoreCase(searchMode)
+                        ? AlarmClock.ALARM_SEARCH_MODE_ALL : AlarmClock.ALARM_SEARCH_MODE_NEXT))));
+                usedMode = normMode;
+                dismiss.putExtra(AlarmClock.EXTRA_ALARM_SEARCH_MODE, normMode);
+                if (label != null && !label.trim().isEmpty()) dismiss.putExtra(AlarmClock.EXTRA_MESSAGE, label.trim());
+                if (hour >= 0 && hour <= 23) dismiss.putExtra(AlarmClock.EXTRA_HOUR, hour);
+                if (minute >= 0 && minute <= 59) dismiss.putExtra(AlarmClock.EXTRA_MINUTES, minute);
+                if (!preferredPkg.isEmpty()) dismiss.setPackage(preferredPkg);
+
+                Context launcher = ScreenControlService.instance != null ? ScreenControlService.instance : context;
+                launcher.startActivity(dismiss);
+                channel = shizukuAuth ? "shizuku_fallback_app_intent" : "app_intent";
+                dispatchOk = true;
+            } catch (Exception e) {
+                String fallbackErr = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                dispatchError = dispatchError.isEmpty() ? fallbackErr : (dispatchError + "；回退失败：" + fallbackErr);
+            }
+        }
+
+        if (dispatchOk) {
+            Thread.sleep(900);
+        }
+
+        long afterNext = getNextAlarmTriggerMs(am);
+        JSONObject afterDump = ShizukuBridge.isAuthorized() ? ShizukuBridge.listAlarmsViaDump() : null;
+        int afterCount = afterDump != null ? afterDump.optInt("alarm_count", -1) : -1;
+        boolean countDropped = (beforeCount > 0 && afterCount >= 0 && afterCount < beforeCount);
+        boolean nextChanged = (beforeNext > 0 && afterNext != beforeNext);
+        boolean verified = dispatchOk && (countDropped || nextChanged || (beforeNext == 0 && afterNext == 0));
+
+        String formattedAfter = afterNext > 0
+                ? new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA).format(new java.util.Date(afterNext))
+                : "无";
+
+        String feedback;
+        if (!dispatchOk) {
+            feedback = "❌ 取消闹钟指令下发失败（" + channel + "）：" + (dispatchError.isEmpty() ? amOutput : dispatchError);
+        } else if (countDropped || nextChanged) {
+            feedback = "✅ 已通过 " + channel + " 下发取消闹钟指令并核验生效，当前系统最近响铃时间：" + formattedAfter;
+        } else {
+            feedback = "⚠️ 已通过 " + channel + " 下发 ACTION_DISMISS_ALARM（模式：" + usedMode
+                    + "），但系统活跃闹钟数未减少（部分 ROM 时钟仅允许 DISMISS_ALARM 关闭正在/即将响铃的闹钟，或需在时钟内关闭开关）。";
+        }
+
+        JSONObject out = new JSONObject()
+                .put("ok", dispatchOk)
+                .put("verified", verified)
+                .put("channel", channel)
+                .put("search_mode", usedMode)
+                .put("target_package", preferredPkg)
+                .put("before_alarm_count", beforeCount)
+                .put("after_alarm_count", afterCount)
+                .put("next_alarm_changed", nextChanged)
+                .put("next_alarm_formatted", formattedAfter)
+                .put("feedback", feedback);
+        if (!amOutput.isEmpty()) out.put("am_output", amOutput);
+        if (!dispatchError.isEmpty()) out.put("dispatch_error", dispatchError);
+        if (afterDump != null && afterDump.optBoolean("available", false)) {
+            out.put("remaining_alarms", afterDump.optJSONArray("alarms"));
+        }
+        return out;
+    }
+
+    /** 原生设置系统倒计时（优先 Shizuku am start SET_TIMER） */
+    JSONObject setTimer(int seconds, String label, boolean skipUi) throws Exception {
+        if (seconds < 1 || seconds > 86400) {
+            throw new IllegalArgumentException("倒计时秒数必须在 1 到 86400 之间");
+        }
+        Intent probeIntent = new Intent(AlarmClock.ACTION_SET_TIMER);
+        String preferredPkg = resolvePreferredAlarmPackage(probeIntent);
+        boolean shizukuAuth = ShizukuBridge.isAuthorized();
+        String channel = "app_intent";
+        boolean dispatchOk = false;
+        String amOutput = "";
+        String dispatchError = "";
+
+        if (shizukuAuth) {
+            try {
+                JSONObject res = ShizukuBridge.setTimerViaShell(seconds, label, skipUi, preferredPkg);
+                channel = "shizuku_am_start";
+                dispatchOk = res.optBoolean("ok", false);
+                amOutput = res.optString("am_output", "");
+            } catch (Exception e) {
+                dispatchError = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            }
+        }
+
+        if (!dispatchOk) {
+            try {
+                Intent timer = new Intent(AlarmClock.ACTION_SET_TIMER)
+                        .putExtra(AlarmClock.EXTRA_LENGTH, seconds)
+                        .putExtra(AlarmClock.EXTRA_SKIP_UI, skipUi)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
+                if (label != null && !label.trim().isEmpty()) timer.putExtra(AlarmClock.EXTRA_MESSAGE, label.trim());
+                if (!preferredPkg.isEmpty()) timer.setPackage(preferredPkg);
+                Context launcher = ScreenControlService.instance != null ? ScreenControlService.instance : context;
+                launcher.startActivity(timer);
+                channel = shizukuAuth ? "shizuku_fallback_app_intent" : "app_intent";
+                dispatchOk = true;
+            } catch (Exception e) {
+                String fallbackErr = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                dispatchError = dispatchError.isEmpty() ? fallbackErr : (dispatchError + "；回退失败：" + fallbackErr);
+            }
+        }
+
+        JSONObject out = new JSONObject()
+                .put("ok", dispatchOk)
+                .put("channel", channel)
+                .put("seconds", seconds)
+                .put("label", label == null ? "" : label.trim())
+                .put("target_package", preferredPkg)
+                .put("feedback", dispatchOk
+                        ? "✅ 已通过 " + channel + " 启动 " + seconds + " 秒倒计时" + (label != null && !label.trim().isEmpty() ? "（" + label.trim() + "）" : "")
+                        : "❌ 启动倒计时失败：" + (dispatchError.isEmpty() ? amOutput : dispatchError));
+        if (!amOutput.isEmpty()) out.put("am_output", amOutput);
+        if (!dispatchError.isEmpty()) out.put("dispatch_error", dispatchError);
+        return out;
+    }
+
+    /** 轻量只读设备状态（电量、亮屏/锁屏、各通道音量与响铃模式、网络与本地时间，0 切屏） */
+    JSONObject deviceStatus() throws Exception {
+        JSONObject out = new JSONObject().put("ok", true);
+
+        android.content.IntentFilter ifilter = new android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+        Intent batt = context.registerReceiver(null, ifilter);
+        if (batt != null) {
+            int level = batt.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1);
+            int scale = batt.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100);
+            int status = batt.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1);
+            int plugged = batt.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0);
+            int tempTenths = batt.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, 0);
+            int pct = (level >= 0 && scale > 0) ? Math.round(level * 100f / scale) : -1;
+            boolean charging = status == android.os.BatteryManager.BATTERY_STATUS_CHARGING
+                    || status == android.os.BatteryManager.BATTERY_STATUS_FULL;
+            String chargeType = "none";
+            if ((plugged & android.os.BatteryManager.BATTERY_PLUGGED_AC) != 0) chargeType = "ac";
+            else if ((plugged & android.os.BatteryManager.BATTERY_PLUGGED_USB) != 0) chargeType = "usb";
+            else if ((plugged & android.os.BatteryManager.BATTERY_PLUGGED_WIRELESS) != 0) chargeType = "wireless";
+            out.put("battery_percent", pct)
+                    .put("is_charging", charging)
+                    .put("charge_type", chargeType)
+                    .put("battery_temp_c", tempTenths / 10.0);
+        }
+
+        android.os.PowerManager pm = (android.os.PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        android.app.KeyguardManager km = (android.app.KeyguardManager) context.getSystemService(Context.KEYGUARD_SERVICE);
+        out.put("screen_on", pm != null && pm.isInteractive())
+                .put("device_locked", km != null && km.isDeviceLocked());
+
+        android.media.AudioManager audio = (android.media.AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+        if (audio != null) {
+            int rm = audio.getRingerMode();
+            String ringerStr = rm == android.media.AudioManager.RINGER_MODE_SILENT ? "silent"
+                    : (rm == android.media.AudioManager.RINGER_MODE_VIBRATE ? "vibrate" : "normal");
+            JSONObject vols = new JSONObject()
+                    .put("music", volumeSnapshot(audio, android.media.AudioManager.STREAM_MUSIC))
+                    .put("ring", volumeSnapshot(audio, android.media.AudioManager.STREAM_RING))
+                    .put("alarm", volumeSnapshot(audio, android.media.AudioManager.STREAM_ALARM))
+                    .put("notification", volumeSnapshot(audio, android.media.AudioManager.STREAM_NOTIFICATION));
+            out.put("ringer_mode", ringerStr)
+                    .put("music_active", audio.isMusicActive())
+                    .put("volumes", vols);
+        }
+
+        try {
+            android.net.ConnectivityManager cm = (android.net.ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+            android.net.Network active = cm != null ? cm.getActiveNetwork() : null;
+            android.net.NetworkCapabilities caps = (cm != null && active != null) ? cm.getNetworkCapabilities(active) : null;
+            boolean connected = caps != null && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET);
+            String netType = "none";
+            if (caps != null) {
+                if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) netType = "wifi";
+                else if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR)) netType = "cellular";
+                else netType = "other";
+            }
+            out.put("network_connected", connected).put("network_type", netType);
+        } catch (Exception ignored) { }
+
+        long now = System.currentTimeMillis();
+        out.put("timestamp_ms", now)
+                .put("local_time", new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA).format(new java.util.Date(now)))
+                .put("timezone", java.util.TimeZone.getDefault().getID());
+
+        return out;
+    }
+
+    private JSONObject volumeSnapshot(android.media.AudioManager audio, int streamType) throws Exception {
+        int cur = audio.getStreamVolume(streamType);
+        int max = Math.max(1, audio.getStreamMaxVolume(streamType));
+        return new JSONObject()
+                .put("current", cur)
+                .put("max", max)
+                .put("percent", Math.round(cur * 100f / max));
+    }
+
+    /** 原生设置音量或响铃模式（0 切屏 + 即时回读核验） */
+    JSONObject setVolume(String stream, int percent, String ringerMode) throws Exception {
+        android.media.AudioManager audio = (android.media.AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+        if (audio == null) throw new IllegalStateException("无法获取 AudioManager");
+        boolean didSomething = false;
+        String warning = "";
+
+        if (ringerMode != null && !ringerMode.trim().isEmpty()) {
+            String rm = ringerMode.trim().toLowerCase(Locale.ROOT);
+            int targetMode;
+            if ("normal".equals(rm)) targetMode = android.media.AudioManager.RINGER_MODE_NORMAL;
+            else if ("vibrate".equals(rm)) targetMode = android.media.AudioManager.RINGER_MODE_VIBRATE;
+            else if ("silent".equals(rm)) targetMode = android.media.AudioManager.RINGER_MODE_SILENT;
+            else throw new IllegalArgumentException("不支持的 ringer_mode：" + ringerMode + "（可选 normal / vibrate / silent）");
+            try {
+                audio.setRingerMode(targetMode);
+                didSomething = true;
+            } catch (SecurityException se) {
+                warning = "系统勿扰策略禁止应用直接切换静音模式：" + se.getMessage();
+            }
+        }
+
+        int streamType = -1;
+        String streamName = stream == null ? "" : stream.trim().toLowerCase(Locale.ROOT);
+        if (!streamName.isEmpty() || percent >= 0) {
+            if (streamName.isEmpty() || "music".equals(streamName) || "media".equals(streamName)) {
+                streamType = android.media.AudioManager.STREAM_MUSIC;
+                streamName = "music";
+            } else if ("ring".equals(streamName)) {
+                streamType = android.media.AudioManager.STREAM_RING;
+            } else if ("alarm".equals(streamName)) {
+                streamType = android.media.AudioManager.STREAM_ALARM;
+            } else if ("notification".equals(streamName)) {
+                streamType = android.media.AudioManager.STREAM_NOTIFICATION;
+            } else if ("call".equals(streamName)) {
+                streamType = android.media.AudioManager.STREAM_VOICE_CALL;
+            } else {
+                throw new IllegalArgumentException("不支持的音量通道：" + stream + "（可选 music / ring / alarm / notification / call）");
+            }
+            if (percent < 0 || percent > 100) {
+                throw new IllegalArgumentException("percent 必须在 0 到 100 之间");
+            }
+            int max = audio.getStreamMaxVolume(streamType);
+            int targetIdx = Math.round(max * (percent / 100f));
+            audio.setStreamVolume(streamType, targetIdx, 0);
+            didSomething = true;
+        }
+
+        if (!didSomething && warning.isEmpty()) {
+            throw new IllegalArgumentException("必须提供 stream+percent 或 ringer_mode 至少一项");
+        }
+
+        int actualRm = audio.getRingerMode();
+        String ringerStr = actualRm == android.media.AudioManager.RINGER_MODE_SILENT ? "silent"
+                : (actualRm == android.media.AudioManager.RINGER_MODE_VIBRATE ? "vibrate" : "normal");
+        JSONObject out = new JSONObject()
+                .put("ok", didSomething)
+                .put("ringer_mode", ringerStr);
+        if (streamType >= 0) {
+            out.put("stream", streamName)
+                    .put("volume", volumeSnapshot(audio, streamType));
+        }
+        if (!warning.isEmpty()) out.put("warning", warning);
+        out.put("feedback", didSomething
+                ? "✅ 已调整系统音量/响铃模式（当前响铃模式：" + ringerStr + "）"
+                : "⚠️ 未能修改响铃模式：" + warning);
+        return out;
+    }
+
+    /** 原生媒体播放控制（play / pause / play_pause / next / previous / stop，0 切屏） */
+    JSONObject mediaControl(String action) throws Exception {
+        String key = action == null ? "" : action.trim().toLowerCase(Locale.ROOT);
+        int keyCode;
+        switch (key) {
+            case "play": keyCode = android.view.KeyEvent.KEYCODE_MEDIA_PLAY; break;
+            case "pause": keyCode = android.view.KeyEvent.KEYCODE_MEDIA_PAUSE; break;
+            case "play_pause": keyCode = android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE; break;
+            case "next": keyCode = android.view.KeyEvent.KEYCODE_MEDIA_NEXT; break;
+            case "previous": keyCode = android.view.KeyEvent.KEYCODE_MEDIA_PREVIOUS; break;
+            case "stop": keyCode = android.view.KeyEvent.KEYCODE_MEDIA_STOP; break;
+            default: throw new IllegalArgumentException("不支持的媒体控制动作：" + action + "（可选 play / pause / play_pause / next / previous / stop）");
+        }
+
+        if (ShizukuBridge.isAuthorized()) {
+            try {
+                JSONObject shellRes = ShizukuBridge.dispatchMediaViaShell(key);
+                if (shellRes.optBoolean("ok", false)) {
+                    return shellRes.put("channel", "shizuku_media_session")
+                            .put("feedback", "✅ 已通过系统媒体会话发送 " + key + " 指令");
+                }
+            } catch (Exception ignored) { }
+        }
+
+        android.media.AudioManager audio = (android.media.AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+        if (audio == null) throw new IllegalStateException("无法获取 AudioManager");
+        long now = android.os.SystemClock.uptimeMillis();
+        audio.dispatchMediaKeyEvent(new android.view.KeyEvent(now, now, android.view.KeyEvent.ACTION_DOWN, keyCode, 0));
+        audio.dispatchMediaKeyEvent(new android.view.KeyEvent(now, now, android.view.KeyEvent.ACTION_UP, keyCode, 0));
+        return new JSONObject()
+                .put("ok", true)
+                .put("channel", "audio_manager_key")
+                .put("action", key)
+                .put("feedback", "✅ 已发送媒体控制按键：" + key);
+    }
+
     /** 列出手机上已安装的可启动应用（支持按应用名称或包名关键字过滤） */
     JSONObject listInstalledApps(String query) throws Exception {
         PackageManager pm = context.getPackageManager();
