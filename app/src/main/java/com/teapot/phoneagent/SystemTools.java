@@ -801,32 +801,182 @@ final class SystemTools {
         return out;
     }
 
-    /** 闭环定闹钟：触发系统时钟并在 550ms 后读取 AlarmManager 验证系统下一闹钟状态 */
+    /** 闭环定闹钟：优先通过 Shizuku (adb_shell) 执行原生 am start SET_ALARM，再轮询 AlarmManager + dumpsys alarm 核验 */
     JSONObject setAlarmAndVerify(int hour, int minute, String label) throws Exception {
-        android.app.AlarmManager am = context.getSystemService(android.app.AlarmManager.class);
-        long beforeNext = (am != null && am.getNextAlarmClock() != null) ? am.getNextAlarmClock().getTriggerTime() : 0L;
-
         Intent alarm = alarmIntent(hour, minute, label);
-        Context launcher = ScreenControlService.instance != null ? ScreenControlService.instance : context;
-        launcher.startActivity(alarm);
-        Thread.sleep(550);
+        android.app.AlarmManager am = context.getSystemService(android.app.AlarmManager.class);
+        long beforeNext = getNextAlarmTriggerMs(am);
 
-        long afterNext = (am != null && am.getNextAlarmClock() != null) ? am.getNextAlarmClock().getTriggerTime() : 0L;
+        long expectedTriggerMs = computeExpectedAlarmMs(hour, minute);
+        String expectedFull = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA)
+                .format(new java.util.Date(expectedTriggerMs));
+        String expectedHhMm = String.format(Locale.ROOT, "%02d:%02d", hour, minute);
+
+        String preferredPkg = resolvePreferredAlarmPackage(alarm);
+        boolean shizukuAuth = ShizukuBridge.isAuthorized();
+        String channel = "app_intent";
+        boolean dispatchOk = false;
+        String amOutput = "";
+        String dispatchError = "";
+
+        if (shizukuAuth) {
+            try {
+                JSONObject shellRes = ShizukuBridge.setAlarmViaShell(hour, minute, label, preferredPkg);
+                channel = "shizuku_am_start";
+                dispatchOk = shellRes.optBoolean("ok", false);
+                amOutput = shellRes.optString("am_output", "");
+            } catch (Exception e) {
+                dispatchError = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            }
+        }
+
+        if (!dispatchOk) {
+            try {
+                if (!preferredPkg.isEmpty()) alarm.setPackage(preferredPkg);
+                Context launcher = ScreenControlService.instance != null ? ScreenControlService.instance : context;
+                launcher.startActivity(alarm);
+                if (!"shizuku_am_start".equals(channel)) {
+                    channel = "app_intent";
+                } else {
+                    channel = "shizuku_fallback_app_intent";
+                }
+                dispatchOk = true;
+            } catch (Exception e) {
+                String fallbackErr = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                dispatchError = dispatchError.isEmpty() ? fallbackErr : (dispatchError + "；回退失败：" + fallbackErr);
+            }
+        }
+
+        long afterNext = beforeNext;
+        boolean matchedTargetTime = false;
+        boolean nextAlarmUpdated = false;
+        String verifiedBy = "none";
+
+        if (dispatchOk) {
+            long waitBudget = shizukuAuth ? 1500L : 2500L;
+            long deadline = System.currentTimeMillis() + waitBudget;
+            while (System.currentTimeMillis() < deadline) {
+                Thread.sleep(250);
+                afterNext = getNextAlarmTriggerMs(am);
+                if (afterNext > 0 && Math.abs(afterNext - expectedTriggerMs) <= 90_000L) {
+                    matchedTargetTime = true;
+                    nextAlarmUpdated = (afterNext != beforeNext);
+                    verifiedBy = "alarm_manager_exact";
+                    break;
+                }
+                if (afterNext > 0 && afterNext != beforeNext) {
+                    nextAlarmUpdated = true;
+                    verifiedBy = "alarm_manager_changed";
+                    // HyperOS 往往会把 AlarmManager 最近一项登记为提前 1 小时的 ALARM_ARRIVING，留给后续 dumpsys 精确核验真实响铃时间
+                    if (shizukuAuth && Math.abs(afterNext - (expectedTriggerMs - 3600_000L)) <= 90_000L) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        JSONObject dumpCheck = null;
+        if (dispatchOk && !matchedTargetTime && ShizukuBridge.isAuthorized()) {
+            dumpCheck = ShizukuBridge.queryAlarmClockDump(expectedFull, expectedHhMm);
+            if (dumpCheck.optBoolean("matched_exact_datetime", false)) {
+                matchedTargetTime = true;
+                verifiedBy = "dumpsys_alarm_exact";
+            } else if (dumpCheck.optBoolean("matched_hhmm", false)) {
+                matchedTargetTime = true;
+                verifiedBy = "dumpsys_alarm_hhmm";
+            }
+        }
+
+        boolean verified = dispatchOk && (matchedTargetTime || (nextAlarmUpdated && afterNext > 0));
         String formattedNext = afterNext > 0
                 ? new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA).format(new java.util.Date(afterNext))
                 : "无";
 
-        return new JSONObject()
-                .put("requested_time", String.format(Locale.ROOT, "%02d:%02d", hour, minute))
+        String feedback;
+        if (verified) {
+            feedback = "✅ 已通过 " + channel + " 设置 " + expectedHhMm + " 闹钟并核验生效（核验来源：" + verifiedBy
+                    + "）；系统当前最近响铃时间：" + formattedNext;
+        } else if (!dispatchOk) {
+            feedback = "❌ 闹钟指令下发失败（" + channel + "）：" + (dispatchError.isEmpty() ? amOutput : dispatchError)
+                    + "。请先检查 Shizuku 状态，或改走离屏副屏打开时钟设置。";
+        } else if (beforeNext > 0 && afterNext == beforeNext) {
+            feedback = "⚠️ 已通过 " + channel + " 下发 " + expectedHhMm + " 闹钟请求，但系统最近闹钟未变化（仍为 " + formattedNext
+                    + "），且未在系统闹钟列表中核验到目标时间；可能被系统时钟限制或需要通过离屏副屏打开时钟核验。";
+        } else {
+            feedback = "⚠️ 已通过 " + channel + " 下发 " + expectedHhMm + " 闹钟请求，但系统 AlarmManager"
+                    + (shizukuAuth ? " 与 dumpsys alarm" : "")
+                    + " 均未检测到激活闹钟；请检查 Shizuku / 系统时钟权限，或改走离屏副屏打开时钟核验。";
+        }
+
+        JSONObject out = new JSONObject()
+                .put("ok", verified)
+                .put("channel", channel)
+                .put("shizuku_authorized", shizukuAuth)
+                .put("target_package", preferredPkg)
+                .put("requested_time", expectedHhMm)
+                .put("expected_time", expectedFull)
                 .put("label", label == null ? "" : label)
-                .put("intent_dispatched", true)
+                .put("intent_dispatched", dispatchOk)
+                .put("verified", verified)
+                .put("verified_by", verifiedBy)
+                .put("matched_target_time", matchedTargetTime)
                 .put("system_has_active_alarm", afterNext > 0)
                 .put("next_alarm_trigger_ms", afterNext)
                 .put("next_alarm_formatted", formattedNext)
-                .put("next_alarm_updated", afterNext != beforeNext)
-                .put("feedback", afterNext > 0
-                        ? "✅ 已向系统时钟提交 " + String.format(Locale.ROOT, "%02d:%02d", hour, minute) + " 闹钟，系统当前登记的最近响铃时间为：" + formattedNext
-                        : "⚠️ 已发送闹钟请求，但系统 AlarmManager 未检测到激活闹钟；可使用 open_app 打开「时钟」通过屏幕控制核验。");
+                .put("next_alarm_updated", nextAlarmUpdated)
+                .put("feedback", feedback);
+        if (!amOutput.isEmpty()) out.put("am_output", amOutput);
+        if (!dispatchError.isEmpty()) out.put("dispatch_error", dispatchError);
+        if (dumpCheck != null) out.put("dumpsys_alarm", dumpCheck);
+        return out;
+    }
+
+    private long getNextAlarmTriggerMs(android.app.AlarmManager am) {
+        if (am == null) return 0L;
+        android.app.AlarmManager.AlarmClockInfo info = am.getNextAlarmClock();
+        return info != null ? info.getTriggerTime() : 0L;
+    }
+
+    private long computeExpectedAlarmMs(int hour, int minute) {
+        java.util.Calendar cal = java.util.Calendar.getInstance();
+        long now = cal.getTimeInMillis();
+        cal.set(java.util.Calendar.HOUR_OF_DAY, hour);
+        cal.set(java.util.Calendar.MINUTE, minute);
+        cal.set(java.util.Calendar.SECOND, 0);
+        cal.set(java.util.Calendar.MILLISECOND, 0);
+        if (cal.getTimeInMillis() <= now) {
+            cal.add(java.util.Calendar.DAY_OF_YEAR, 1);
+        }
+        return cal.getTimeInMillis();
+    }
+
+    private String resolvePreferredAlarmPackage(Intent alarm) {
+        try {
+            PackageManager pm = context.getPackageManager();
+            List<android.content.pm.ResolveInfo> handlers = pm.queryIntentActivities(alarm, 0);
+            if (handlers == null || handlers.isEmpty()) return "";
+            if (handlers.size() == 1) {
+                return handlers.get(0).activityInfo != null ? handlers.get(0).activityInfo.packageName : "";
+            }
+            List<String> preferred = Arrays.asList(
+                    "com.android.deskclock",
+                    "com.google.android.deskclock",
+                    "com.coloros.alarmclock",
+                    "com.oneplus.deskclock",
+                    "com.sec.android.app.clockpackage",
+                    "com.android.BBKClock",
+                    "com.huawei.deskclock",
+                    "com.hihonor.deskclock"
+            );
+            for (String p : preferred) {
+                for (android.content.pm.ResolveInfo ri : handlers) {
+                    if (ri.activityInfo != null && p.equals(ri.activityInfo.packageName)) return p;
+                }
+            }
+            return handlers.get(0).activityInfo != null ? handlers.get(0).activityInfo.packageName : "";
+        } catch (Exception ignored) {
+            return "";
+        }
     }
 
     /** 列出手机上已安装的可启动应用（支持按应用名称或包名关键字过滤） */

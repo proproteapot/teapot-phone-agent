@@ -380,6 +380,151 @@ final class ShizukuBridge {
                 .put("am_output", amOut.trim());
     }
 
+    /** 通过 Shizuku (adb_shell uid=2000) 执行受控原生 am start SET_ALARM 命令，绕开普通 App 后台启动拦截 */
+    static JSONObject setAlarmViaShell(int hour, int minute, String label, String targetPackage) throws Exception {
+        ensurePrivilegedReady();
+        if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+            throw new IllegalArgumentException("时间无效");
+        }
+        String cleanPkg = targetPackage == null ? "" : targetPackage.trim();
+        if (!cleanPkg.isEmpty()) {
+            if (!cleanPkg.matches("[a-zA-Z0-9._]+")) {
+                throw new IllegalArgumentException("非法时钟包名: " + cleanPkg);
+            }
+            if (ScreenControlService.isProtectedPackage(cleanPkg)) {
+                throw new SecurityException("安全保护：禁止通过 Shizuku 启动受保护系统包（" + cleanPkg + "）");
+            }
+        }
+        String cleanLabel = sanitizeAlarmLabel(label);
+
+        List<String> cmd = new ArrayList<>();
+        cmd.add("am");
+        cmd.add("start");
+        cmd.add("-a");
+        cmd.add("android.intent.action.SET_ALARM");
+        cmd.add("--ei");
+        cmd.add("android.intent.extra.alarm.HOUR");
+        cmd.add(String.valueOf(hour));
+        cmd.add("--ei");
+        cmd.add("android.intent.extra.alarm.MINUTES");
+        cmd.add(String.valueOf(minute));
+        cmd.add("--ez");
+        cmd.add("android.intent.extra.alarm.SKIP_UI");
+        cmd.add("true");
+        if (!cleanLabel.isEmpty()) {
+            cmd.add("--es");
+            cmd.add("android.intent.extra.alarm.MESSAGE");
+            cmd.add(cleanLabel);
+        }
+        if (!cleanPkg.isEmpty()) {
+            cmd.add("-p");
+            cmd.add(cleanPkg);
+        }
+
+        String amOut = runPrivilegedCmd(cmd.toArray(new String[0])).trim();
+        String lower = amOut.toLowerCase(Locale.ROOT);
+        boolean hasError = lower.contains("error:")
+                || lower.contains("exception")
+                || lower.contains("unable to resolve")
+                || lower.contains("permission denial");
+
+        return new JSONObject()
+                .put("ok", !hasError)
+                .put("target_package", cleanPkg)
+                .put("am_output", amOut);
+    }
+
+    /** 只读解析 dumpsys alarm 中的系统闹钟摘要（精确识别 Alarm clock / ALARM_ALERT 块，兼容 HyperOS 提前提醒机制） */
+    static JSONObject queryAlarmClockDump(String expectedDateTimePrefix, String expectedHhMm) {
+        JSONObject out = new JSONObject();
+        JSONArray matches = new JSONArray();
+        boolean matchedExact = false;
+        boolean matchedTimeOnly = false;
+        try {
+            if (!isAuthorized()) {
+                return out.put("available", false);
+            }
+            String dump = runPrivilegedCmd("dumpsys", "alarm");
+            String currentTag = "";
+            String currentPkg = "";
+            boolean inAlarmClockBlock = false;
+            String[] lines = dump.split("\n");
+            for (String raw : lines) {
+                String line = raw.trim();
+                if (line.isEmpty()) continue;
+
+                if (line.contains("Alarm{") && (line.startsWith("RTC") || line.startsWith("ELAPSED"))) {
+                    currentTag = "";
+                    currentPkg = "";
+                    inAlarmClockBlock = false;
+                    int lastSpace = line.lastIndexOf(' ');
+                    int endBrace = line.lastIndexOf('}');
+                    if (lastSpace > 0 && endBrace > lastSpace) {
+                        currentPkg = line.substring(lastSpace + 1, endBrace).trim();
+                    }
+                    continue;
+                }
+                if (line.startsWith("tag=")) {
+                    currentTag = line.substring(4).trim();
+                    continue;
+                }
+                if (line.equals("Alarm clock:")) {
+                    inAlarmClockBlock = true;
+                    continue;
+                }
+                if (inAlarmClockBlock && line.startsWith("triggerTime=")) {
+                    String triggerVal = line.substring("triggerTime=".length()).trim();
+                    boolean isPreAlert = currentTag.contains("ALARM_ARRIVING");
+                    boolean exactHit = expectedDateTimePrefix != null && !expectedDateTimePrefix.isEmpty()
+                            && triggerVal.contains(expectedDateTimePrefix);
+                    boolean hhmmHit = expectedHhMm != null && !expectedHhMm.isEmpty()
+                            && (triggerVal.contains(" " + expectedHhMm + ":") || triggerVal.contains("T" + expectedHhMm + ":"));
+                    if (exactHit && !isPreAlert) matchedExact = true;
+                    if (hhmmHit && !isPreAlert) matchedTimeOnly = true;
+
+                    String summary = (currentPkg.isEmpty() ? "alarm" : currentPkg)
+                            + (currentTag.isEmpty() ? "" : " [" + currentTag + "]")
+                            + " -> " + triggerVal;
+                    if (matches.length() < 10) {
+                        matches.put(summary.length() > 220 ? summary.substring(0, 220) + "..." : summary);
+                    }
+                    inAlarmClockBlock = false;
+                    continue;
+                }
+                if (inAlarmClockBlock && !raw.startsWith("        ")) {
+                    inAlarmClockBlock = false;
+                }
+            }
+            out.put("available", true)
+                    .put("matched_exact_datetime", matchedExact)
+                    .put("matched_hhmm", matchedTimeOnly)
+                    .put("entries", matches);
+        } catch (Exception e) {
+            try {
+                out.put("available", false).put("error", e.getMessage());
+            } catch (Exception ignored) { }
+        }
+        return out;
+    }
+
+    private static String sanitizeAlarmLabel(String raw) {
+        if (raw == null) return "";
+        StringBuilder sb = new StringBuilder();
+        String trimmed = raw.trim();
+        for (int i = 0; i < trimmed.length() && sb.length() < 120; i++) {
+            char c = trimmed.charAt(i);
+            if (c >= 0x20 && c != 0x7F) {
+                sb.append(c);
+            }
+        }
+        String clean = sb.toString().trim();
+        // 避免 am start 将以 '-' 开头的文本误解析为命令行选项
+        if (clean.startsWith("-")) {
+            clean = " " + clean;
+        }
+        return clean;
+    }
+
     static boolean inputTapOnDisplay(int displayId, int x, int y) {
         try {
             String out = runPrivilegedCmd("input", "-d", String.valueOf(displayId), "tap", String.valueOf(x), String.valueOf(y));

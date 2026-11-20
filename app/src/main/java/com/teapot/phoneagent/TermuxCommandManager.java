@@ -288,6 +288,10 @@ final class TermuxCommandManager {
 
             JSONObject out = record.toJson();
             out.put("ok", !"failed".equals(record.stage));
+            out.put("callback_received", cb != null);
+            if (cb == null) {
+                out.put("warning", "未在等待时间内收到 Termux 执行回调：请检查 Termux ~/.termux/termux.properties 是否启用 allow-external-apps=true，以及系统是否允许 Termux 后台自启动。");
+            }
             if (!"failed".equals(record.stage)) {
                 out.put("log_tail", fetchLogTail(context, record, 40));
             }
@@ -306,15 +310,19 @@ final class TermuxCommandManager {
                     record.stage = "completed";
                 }
             } else {
-                // 命令耗时超过 waitLimit，仍在后台执行中
-                record.stage = "process_started";
+                // 等待时间内未收到回调：可能命令仍在后台运行，也可能被 Termux/系统策略拦截
+                record.stage = "submitted";
             }
             record.updatedAt = System.currentTimeMillis();
             persist(context);
 
             JSONObject out = record.toJson();
-            out.put("ok", !"failed".equals(record.stage));
+            out.put("ok", cb != null && !"failed".equals(record.stage));
+            out.put("callback_received", cb != null);
             out.put("log_tail", record.lastOutput);
+            if (cb == null) {
+                out.put("warning", "未在等待时间内收到 Termux 执行回调：可能是命令仍在运行，或 Termux 未启用 allow-external-apps=true / 被系统后台拦截；如需执行系统特权命令（如 am start），请改用内置 Shizuku 工具而非 Termux。");
+            }
             return out;
         }
     }
@@ -512,7 +520,11 @@ final class TermuxCommandManager {
                     PendingIntent.FLAG_ONE_SHOT | PendingIntent.FLAG_MUTABLE
             );
             intent.putExtra("com.termux.RUN_COMMAND_PENDING_INTENT", pi);
-            context.startService(intent);
+            try {
+                context.startForegroundService(intent);
+            } catch (Exception fgsErr) {
+                context.startService(intent);
+            }
 
             waiter.latch.await(Math.max(300, timeoutMs), TimeUnit.MILLISECONDS);
             return waiter.result;

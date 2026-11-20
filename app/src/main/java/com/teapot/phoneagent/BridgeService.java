@@ -158,8 +158,9 @@ public final class BridgeService extends Service {
                 JSONObject result;
                 if ("initialize".equals(method)) {
                     String harnessInstructions = "你已接入 Teapot Phone-Agent 自主闭环执行框架 (Autonomous Phone Agent Harness)。\n"
-                            + "【核心工作准则：多步自主闭环 + 离屏副屏优先，禁止无故抢占主屏】\n"
-                            + "1. 【后台/不打扰主屏操作普通 App】：当用户要求「在后台」「不切主屏」「趁我用手机时」查看或操作任意 App（如 QQ、浏览器等），禁止直接用主屏 open_app 或只看通知栏就放弃！请优先走离屏虚拟屏链路：\n"
+                            + "【核心工作准则：能用指令不用副屏，能用副屏不用主屏，禁止无故抢占主屏】\n"
+                            + "0. 【系统指令直达最高优先】：定闹钟（`request_alarm`，已内置 Shizuku adb_shell 通道与 AlarmManager/dumpsys alarm 闭环核验）、日历、相册与文件读写等，直接调用对应原生工具，无需切屏也不要用 `termux_run` 执行 `am` 系统命令。\n"
+                            + "1. 【离屏副屏操作普通 App】：当原生指令无法覆盖、需要操作普通 App（如 QQ、浏览器等）时，禁止直接用主屏 open_app 或只看通知栏就放弃！请优先走离屏虚拟屏链路：\n"
                             + "   - 先调用 `virtual_display_create` 创建隐形离屏虚拟屏（拿到 `display_id`）；\n"
                             + "   - 调用 `open_app_on_display(app, display_id)` 在副屏启动目标 App；\n"
                             + "   - 使用带 `display_id` 和 `expected_package` 守卫的 `screen_observe` / `screen_click_text` / `screen_tap(view_id=...)` / `screen_swipe` / `screen_set_text` / `screen_back` / `screen_screenshot` 完成多步闭环读取与操作；\n"
@@ -360,7 +361,7 @@ public final class BridgeService extends Service {
                             .put(tool("fs_zip", "将一个或多个文件/文件夹打包压缩为 .zip 压缩包", fsZipSchema))
                             .put(tool("fs_unzip", "预览或解压 .zip 压缩包到指定目录（带路径穿越安全校验）", fsUnzipSchema))
                             .put(tool("open_file_on_phone", "在手机屏幕上调用系统应用直接打开指定文件，并自动返回打开后的屏幕状态快照", fsPathSchema))
-                            .put(tool("request_alarm", "直接设置手机系统闹钟，并自动读取系统 AlarmManager 核验真实生效的下一响铃时间（闭环验证）", alarmSchema))
+                            .put(tool("request_alarm", "优先通过 Shizuku (adb_shell) 直接执行原生 am start (SET_ALARM + SKIP_UI=true) 设置手机系统闹钟（不打扰主屏），并结合 AlarmManager 与 dumpsys alarm 自动闭环核验真实生效状态", alarmSchema))
                             .put(tool("list_installed_apps", "列出或搜索手机上已安装的应用名称与包名", listAppsSchema))
                             .put(tool("open_app", "按应用名称（如'微信'、'浏览器'、'时钟'、'相册'）或包名直接启动应用，等待加载后自动返回新页面快照", openAppSchema))
                             .put(tool("request_screen_control", "请求开启或续期临时屏幕控制会话（默认需手机本机人工确认；若在设置中开启自动续期则自动激活）并返回当前屏幕快照", schema))
@@ -426,7 +427,7 @@ public final class BridgeService extends Service {
                         int hour = a.getInt("hour"), minute = a.getInt("minute");
                         String label = a.optString("label", "");
                         JSONObject verify = new SystemTools(BridgeService.this).setAlarmAndVerify(hour, minute, label);
-                        result = textResult(verify.toString(), false);
+                        result = textResult(verify.toString(), !verify.optBoolean("ok", false));
                     } catch (Exception e) { result = textResult("设置闹钟失败：" + e.getMessage(), true); }
                 } else if ("tools/call".equals(method) && "list_installed_apps".equals(req.getJSONObject("params").getString("name"))) {
                     try {
